@@ -10,3 +10,6 @@ TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB = 179.0
 
 # Зоны для заказа плавающего IP (сначала spb-3, при ошибке — msk-1).
 TWC_FLOAT_IP_ZONES: tuple[str, ...] = ("spb-3", "msk-1")
+
+# Пауза перебора после «лимита месяца» / недостатка средств на месяц (секунды).
+TWC_MONTH_LIMIT_COOLDOWN_SEC = 86400

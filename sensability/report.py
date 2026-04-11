@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from sensability.account_sync import account_eligible_for_brute
 from sensability.config import Config
+from sensability.twc_constants import TWC_MONTH_LIMIT_COOLDOWN_SEC
 from sensability.db import Database
 from sensability.ip_pool import load_networks
 from sensability.stats import StatsCollector
@@ -40,7 +41,11 @@ async def build_daily_report(
             eligible += 1
         if acc.limited_by_day and acc.limited_by_day_ts and now < acc.limited_by_day_ts + 86400:
             cooldown24 += 1
-        if acc.limited_by_month and acc.limited_by_month_ts and now < acc.limited_by_month_ts + 3600:
+        if (
+            acc.limited_by_month
+            and acc.limited_by_month_ts
+            and now < acc.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC
+        ):
             month_lim += 1
 
     nets = load_networks(str(cfg.subnets_path))

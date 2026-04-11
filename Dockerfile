@@ -22,4 +22,6 @@ COPY sensability ./sensability
 COPY subnets.txt ./subnets.txt
 
 ENV PYTHONUNBUFFERED=1
+# SQLite и прочие данные по умолчанию; в compose примонтируйте том на ./data
+ENV SENSABILITY_DATA_DIR=/app/data
 CMD ["python", "-m", "sensability"]

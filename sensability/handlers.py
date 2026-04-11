@@ -22,6 +22,7 @@ from sensability.notify import TelegramNotify
 from sensability.report import build_daily_report
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, code, esc
+from sensability.twc_constants import TWC_MONTH_LIMIT_COOLDOWN_SEC
 from sensability.twc_client import (
     TimewebClient,
     extract_ipv4_from_server,
@@ -240,8 +241,8 @@ async def handle_account_terminal_commands(
         left_day = f"{left // 3600}ч {(left % 3600) // 60}м"
     left_m = "—"
     if row.limited_by_month and row.limited_by_month_ts:
-        lm = max(0, int(row.limited_by_month_ts + 3600 - now))
-        left_m = f"{lm // 60}м {lm % 60}с"
+        lm = max(0, int(row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC - now))
+        left_m = f"{lm // 3600}ч {(lm % 3600) // 60}м"
     bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
     mode_ip = (
         "📡 плавающий IPv4 (без ВМ)"
@@ -592,8 +593,8 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             left_day = f"{left // 3600}ч {(left % 3600) // 60}м"
         left_m = "—"
         if row.limited_by_month and row.limited_by_month_ts:
-            lm = max(0, int(row.limited_by_month_ts + 3600 - now))
-            left_m = f"{lm // 60}м {lm % 60}с"
+            lm = max(0, int(row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC - now))
+            left_m = f"{lm // 3600}ч {(lm % 3600) // 60}м"
         bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
         mode_ip = (
             "📡 плавающий IPv4 (без ВМ)"

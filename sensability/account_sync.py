@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Any
 from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.jwt_util import jwt_payload_unverified
-from sensability.twc_constants import TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB
+from sensability.twc_constants import (
+    TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB,
+    TWC_MONTH_LIMIT_COOLDOWN_SEC,
+)
 from sensability.twc_client import (
     TimewebClient,
     deep_find_email,
@@ -21,7 +24,7 @@ if TYPE_CHECKING:
 def _expire_limits(row: AccountRow, now: float) -> dict[str, Any]:
     patch: dict[str, Any] = {}
     if row.limited_by_month:
-        if not row.limited_by_month_ts or now >= row.limited_by_month_ts + 3600:
+        if not row.limited_by_month_ts or now >= row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC:
             patch["limited_by_month"] = 0
             patch["limited_by_month_ts"] = None
     if row.limited_by_day:
@@ -98,7 +101,7 @@ def account_eligible_for_brute(row: AccountRow, cfg: Config) -> bool:
         return False
     now = time.time()
     if row.limited_by_month and row.limited_by_month_ts:
-        if now < row.limited_by_month_ts + 3600:
+        if now < row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC:
             return False
     if row.limited_by_day and row.limited_by_day_ts:
         if now < row.limited_by_day_ts + 86400:

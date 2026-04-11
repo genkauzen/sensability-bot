@@ -385,6 +385,18 @@ class BruteOrchestrator:
                     await self.stats.add_month_err()
                     await self.db.log_event("month_balance_error", name, {"message": msg[:2000]})
                     return
+                if looks_like_daily_limit_error(msg) or e.status == 429:
+                    await self.db.patch_account(
+                        name,
+                        {"limited_by_month": 1, "limited_by_month_ts": time.time()},
+                    )
+                    await self.stats.add_month_err()
+                    await self.db.log_event(
+                        "month_limit_float_create",
+                        name,
+                        {"zone": zone, "message": msg[:2000]},
+                    )
+                    return
                 continue
 
         if not data:
@@ -419,13 +431,14 @@ class BruteOrchestrator:
                     pub_ip = extract_ipv4_from_floating_record(inner)
             except TimewebApiError as ex:
                 pmsg = parse_error_message(ex)
+                # После успешного POST float IP ответ «Daily limit» у API по смыслу ближе к месячному лимиту/тарифу, не к суточному перебору ВМ.
                 if looks_like_daily_limit_error(pmsg) or ex.status == 429:
                     await self.db.patch_account(
                         name,
-                        {"limited_by_day": 1, "limited_by_day_ts": time.time()},
+                        {"limited_by_month": 1, "limited_by_month_ts": time.time()},
                     )
-                    await self.stats.add_cooldown24()
-                    await self.db.log_event("daily_limit_float", name, {"msg": pmsg[:800]})
+                    await self.stats.add_month_err()
+                    await self.db.log_event("month_limit_float_poll", name, {"msg": pmsg[:800]})
                     try:
                         await self.twc.delete_floating_ip(row.api_key, fid)
                     except Exception:
