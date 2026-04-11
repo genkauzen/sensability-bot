@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+
+from sensability.twc_debug import (
+    TwcApiDebugController,
+    build_request_debug_html,
+    build_response_debug_html,
+)
 
 BASE = "https://api.timeweb.cloud"
 
@@ -32,8 +39,16 @@ def looks_like_month_balance_error(message: str) -> bool:
 
 
 class TimewebClient:
-    def __init__(self, proxy: str | None) -> None:
+    def __init__(
+        self,
+        proxy: str | None,
+        *,
+        debug_ctrl: TwcApiDebugController | None = None,
+        debug_emit: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         self._proxy = proxy
+        self._debug_ctrl = debug_ctrl
+        self._debug_emit = debug_emit
         self._client = httpx.AsyncClient(
             base_url=BASE,
             proxy=proxy,
@@ -47,6 +62,13 @@ class TimewebClient:
     def _auth(self, api_key: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {api_key}"}
 
+    async def _emit_debug_parts(self, parts: list[str]) -> None:
+        emit = self._debug_emit
+        if not emit or not parts:
+            return
+        for chunk in parts:
+            await emit(chunk)
+
     async def _request(
         self,
         method: str,
@@ -55,6 +77,12 @@ class TimewebClient:
         *,
         json_body: Any | None = None,
     ) -> Any:
+        dbg = self._debug_ctrl
+        if dbg and dbg.mode in ("full", "mid"):
+            await self._emit_debug_parts(
+                build_request_debug_html(dbg.mode, method, path, json_body)
+            )
+
         r = await self._client.request(
             method,
             path,
@@ -66,6 +94,14 @@ class TimewebClient:
             data = r.json()
         except Exception:
             data = None
+
+        if dbg and dbg.mode in ("full", "mid"):
+            await self._emit_debug_parts(
+                build_response_debug_html(
+                    dbg.mode, method, path, r.status_code, text, data, r.is_success
+                )
+            )
+
         if r.is_success:
             return data
         raise TimewebApiError(r.status_code, text, data if isinstance(data, dict) else None)

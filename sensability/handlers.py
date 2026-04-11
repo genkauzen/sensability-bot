@@ -111,6 +111,9 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 "/modules — активные компоненты",
                 "/stop — приостановить перебор IP",
                 "/continue — продолжить перебор",
+                "/debug — лог TWC API: полные запрос и ответ (в blockquote)",
+                "/debug -mid — краткий лог (зона, параметры ВМ, суть ответа)",
+                "/debug -low — отключить лог TWC",
                 "/drop — docker compose down",
                 "/restart — пересоздать контейнеры (force-recreate)",
                 "/rebuild — build --no-cache + up force-recreate",
@@ -118,6 +121,64 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             ]
         )
         await notify.terminal_reply(tid, body)
+        return
+
+    parts = text.split()
+    if parts and parts[0].lower() == "/debug":
+        dbg = context.application.bot_data.get("twc_debug")
+        if dbg is None:
+            await notify.terminal_reply(tid, "❌ " + bold("Отладка TWC") + " недоступна.")
+            return
+        if len(parts) == 1:
+            dbg.mode = "full"
+            label = bold("полный") + " (каждый запрос и ответ — в цитате Telegram)"
+        elif len(parts) == 2:
+            flag = parts[1].lower()
+            if flag in ("-mid", "mid"):
+                dbg.mode = "mid"
+                label = bold("средний") + " (📍 зона, ⚙️ ВМ, 📥 статус/IP без сырых JSON)"
+            elif flag in ("-low", "low"):
+                dbg.mode = "low"
+                label = bold("выкл") + " — как обычно"
+            else:
+                await notify.terminal_reply(
+                    tid,
+                    "Формат: "
+                    + code("/debug")
+                    + ", "
+                    + code("/debug -mid")
+                    + ", "
+                    + code("/debug -low"),
+                )
+                return
+        else:
+            await notify.terminal_reply(
+                tid,
+                "Формат: "
+                + code("/debug")
+                + ", "
+                + code("/debug -mid")
+                + ", "
+                + code("/debug -low"),
+            )
+            return
+        warn = ""
+        if cfg.topic_terminal is None:
+            warn = (
+                "\n⚠️ "
+                + bold("TOPIC_ID_TERMINAL")
+                + " не задан в .env — лог TWC в Telegram не отправится, пока не настроите топик."
+            )
+        await notify.terminal_reply(
+            tid,
+            "🔧 "
+            + bold("Режим лога Timeweb API")
+            + ": "
+            + label
+            + "\n"
+            + "Сообщения идут в топик терминала (как и этот чат)."
+            + warn,
+        )
         return
 
     if low == "/modules":

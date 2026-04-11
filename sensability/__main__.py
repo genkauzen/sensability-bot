@@ -18,6 +18,7 @@ from sensability.notify import TelegramNotify
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, esc
 from sensability.twc_client import TimewebClient
+from sensability.twc_debug import TwcApiDebugController
 
 log = logging.getLogger("sensability")
 
@@ -81,10 +82,18 @@ def main() -> None:
     application = builder.build()
 
     twc_proxy = cfg.twc_proxy_url if cfg.twc_proxy_use and cfg.twc_proxy_url else None
-    twc = TimewebClient(twc_proxy)
+    twc_debug = TwcApiDebugController()
     db = Database(db_path(cfg))
     stats = StatsCollector()
     notify = TelegramNotify(application.bot, cfg)
+
+    async def twc_debug_emit(html: str) -> None:
+        tid = cfg.topic_terminal
+        if tid is None:
+            return
+        await notify.terminal_reply(tid, html)
+
+    twc = TimewebClient(twc_proxy, debug_ctrl=twc_debug, debug_emit=twc_debug_emit)
     nets = load_networks(str(cfg.subnets_path))
     orchestrator = BruteOrchestrator(cfg, db, twc, stats, notify, nets)
 
@@ -93,6 +102,7 @@ def main() -> None:
         cfg=cfg,
         db=db,
         twc=twc,
+        twc_debug=twc_debug,
         stats=stats,
         notify=notify,
         orchestrator=orchestrator,
