@@ -7,7 +7,12 @@ from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.jwt_util import jwt_payload_unverified
 from sensability.twc_constants import TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB
-from sensability.twc_client import TimewebClient, deep_find_email, finances_balance_rubles
+from sensability.twc_client import (
+    TimewebClient,
+    deep_find_email,
+    deep_find_full_name,
+    finances_balance_rubles,
+)
 
 if TYPE_CHECKING:
     pass
@@ -39,20 +44,24 @@ async def sync_account(db: Database, twc: TimewebClient, cfg: Config, name: str)
     bal: float | None = None
     cur: str | None = None
     acc_email: str | None = None
+    acc_fn: str | None = None
     try:
         fin = await twc.get_finances(row.api_key)
         bal, cur = finances_balance_rubles(fin)
+        acc_fn = deep_find_full_name(fin) or acc_fn
     except Exception:
         pass
     try:
         st = await twc.get_account_status(row.api_key)
         acc_email = deep_find_email(st) or acc_email
+        acc_fn = deep_find_full_name(st) or acc_fn
     except Exception:
         pass
     if not acc_email:
         try:
             ns = await twc.get_notification_settings(row.api_key)
             acc_email = deep_find_email(ns) or acc_email
+            acc_fn = deep_find_full_name(ns) or acc_fn
         except Exception:
             pass
 
@@ -62,6 +71,7 @@ async def sync_account(db: Database, twc: TimewebClient, cfg: Config, name: str)
 
     patch["acc_login"] = acc_login
     patch["acc_email"] = acc_email
+    patch["acc_full_name"] = acc_fn
     patch["balance_cached"] = bal
     patch["currency"] = cur
     patch["limited_by_balance"] = 1 if limited_by_balance else 0

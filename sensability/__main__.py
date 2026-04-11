@@ -13,7 +13,7 @@ from sensability.brute_worker import BruteOrchestrator
 from sensability.config import Config, load_config
 from sensability.db import Database, db_path
 from sensability.handlers import on_message, schedule_daily
-from sensability.ip_pool import load_networks
+from sensability.ip_pool import load_networks, load_potential_networks
 from sensability.notify import TelegramNotify
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, esc
@@ -95,7 +95,8 @@ def main() -> None:
 
     twc = TimewebClient(twc_proxy, debug_ctrl=twc_debug, debug_emit=twc_debug_emit)
     nets = load_networks(str(cfg.subnets_path))
-    orchestrator = BruteOrchestrator(cfg, db, twc, stats, notify, nets)
+    pot = load_potential_networks(str(cfg.potential_subnets_path))
+    orchestrator = BruteOrchestrator(cfg, db, twc, stats, notify, nets, pot)
 
     tz = os.getenv("TZ", "Europe/Moscow")
     application.bot_data.update(

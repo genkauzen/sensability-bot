@@ -13,7 +13,7 @@ from sensability.account_sync import (
 )
 from sensability.config import Config
 from sensability.db import AccountRow, Database
-from sensability.ip_pool import ipv4_in_pool
+from sensability.ip_pool import ipv4_in_any_potential, ipv4_in_pool
 from sensability.notify import TelegramNotify
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, code, esc, spoiler_code
@@ -31,6 +31,7 @@ from sensability.twc_client import (
     floating_ip_record_from_response,
     is_floating_ip_not_found,
     is_server_not_found,
+    looks_like_daily_limit_error,
     looks_like_month_balance_error,
     parse_error_message,
 )
@@ -42,7 +43,7 @@ log = logging.getLogger("sensability.brute")
 
 POLL_INTERVAL = 3.0
 POLL_ATTEMPTS = 45
-NOTFOUND_GIVEUP = 3
+NOTFOUND_GIVEUP = 1
 
 
 class BruteOrchestrator:
@@ -54,6 +55,7 @@ class BruteOrchestrator:
         stats: StatsCollector,
         notify: TelegramNotify,
         networks: tuple,
+        potential_networks: tuple,
     ) -> None:
         self.cfg = cfg
         self.db = db
@@ -61,6 +63,7 @@ class BruteOrchestrator:
         self.stats = stats
         self.notify = notify
         self._networks = networks
+        self._potential_networks = potential_networks
         self._sem = asyncio.Semaphore(cfg.twc_atmoment_acc)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
@@ -90,6 +93,55 @@ class BruteOrchestrator:
             body["availability_zone"] = zone
         return body
 
+    def _ip_live_extra_lines(self, pub_ip: str | None) -> list[str]:
+        if not pub_ip:
+            return [
+                "┈ " + bold("Пул ПНА") + ": —",
+                "┈ " + bold("Потенциал (±2 к октетам)") + ": —",
+            ]
+        in_pool = ipv4_in_pool(pub_ip, self._networks)
+        pot = (
+            ipv4_in_any_potential(pub_ip, self._potential_networks, delta=2)
+            if self._potential_networks
+            else False
+        )
+        pl = "✅ в ПНА" if in_pool else "❌ вне ПНА"
+        pt = "✅ рядом с потенциальной подсетью" if pot else "— вне потенциала"
+        return [
+            "┈ " + bold("Пул ПНА") + f": {pl}",
+            "┈ " + bold("Потенциал") + f": {pt}",
+        ]
+
+    async def _try_cleanup_orphan_vm(self, name: str, row: AccountRow, vm_name: str) -> bool:
+        try:
+            lst = await self.twc.list_servers(row.api_key)
+            for s in lst.get("servers") or []:
+                if not isinstance(s, dict):
+                    continue
+                if str(s.get("name") or "") != vm_name:
+                    continue
+                sid = int(s.get("id") or 0)
+                if not sid:
+                    continue
+                try:
+                    await self.twc.delete_server(row.api_key, sid)
+                except TimewebApiError:
+                    pass
+                await self.db.patch_account(
+                    name,
+                    {"limited_by_month": 1, "limited_by_month_ts": time.time()},
+                )
+                await self.db.log_event(
+                    "orphan_unpaid_vm",
+                    name,
+                    {"server_id": sid, "vm_name": vm_name},
+                )
+                await self.stats.add_month_err()
+                return True
+        except Exception:
+            log.exception("orphan vm cleanup %s", name)
+        return False
+
     async def run_once_account(self, name: str) -> None:
         if self._brute_paused:
             return
@@ -108,7 +160,7 @@ class BruteOrchestrator:
                 await self._run_brute_vm(name, row)
 
     async def _run_brute_vm(self, name: str, row: AccountRow) -> None:
-        await self.stats.track_account(name)
+        await self.stats.track_account(name, row.balance_cached)
         vm_name = f"{self.cfg.twc_vm_name}-{row.name}-{uuid.uuid4().hex[:8]}"
         body = self._build_create_body(vm_name)
 
@@ -131,9 +183,11 @@ class BruteOrchestrator:
                 )
                 await self.stats.add_month_err()
                 await self.db.log_event("month_balance_error", name, {"message": msg[:2000]})
-            else:
-                await self.stats.add_vm_fail()
-                await self.db.log_event("create_fail", name, {"status": e.status, "msg": msg[:2000]})
+                return
+            if await self._try_cleanup_orphan_vm(name, row, vm_name):
+                return
+            await self.stats.add_vm_fail()
+            await self.db.log_event("create_fail", name, {"status": e.status, "msg": msg[:2000]})
             return
 
         await self.stats.add_vm_ok()
@@ -148,6 +202,24 @@ class BruteOrchestrator:
         server_id = int(sid)
         root_pass = str(server.get("root_pass") or "")
         region = str(server.get("availability_zone") or self.cfg.twc_vm_region or "—")
+
+        for attempt in range(3):
+            try:
+                await asyncio.sleep(3.0 if attempt else 2.0)
+                await self.twc.add_server_ipv4(row.api_key, server_id)
+                break
+            except TimewebApiError as ex:
+                if attempt >= 2:
+                    await self.notify.logs(
+                        "⚠️ "
+                        + bold("POST /servers/…/ips (ipv4)")
+                        + f" {code(name)} после 3 попыток: {esc(parse_error_message(ex)[:500])}"
+                    )
+                elif self.cfg.full_logs:
+                    await self.notify.logs(
+                        f"{bold('add_server_ipv4')} попытка {attempt + 2}/3 {esc(name)}: "
+                        f"{esc(parse_error_message(ex)[:300])}"
+                    )
 
         pub_ip: str | None = None
         notfound_streak = 0
@@ -169,6 +241,19 @@ class BruteOrchestrator:
                         pub_ip = ip
                         break
             except TimewebApiError as ex:
+                pmsg = parse_error_message(ex)
+                if looks_like_daily_limit_error(pmsg) or ex.status == 429:
+                    await self.db.patch_account(
+                        name,
+                        {"limited_by_day": 1, "limited_by_day_ts": time.time()},
+                    )
+                    await self.stats.add_cooldown24()
+                    await self.db.log_event("daily_limit_api", name, {"msg": pmsg[:800]})
+                    try:
+                        await self.twc.delete_server(row.api_key, server_id)
+                    except Exception:
+                        pass
+                    return
                 if is_server_not_found(ex):
                     notfound_streak += 1
                     if self.cfg.full_logs:
@@ -194,7 +279,7 @@ class BruteOrchestrator:
                         await self.db.log_event(
                             "vm_registry_drop",
                             name,
-                            {"server_id": server_id, "reason": "404 x3"},
+                            {"server_id": server_id, "reason": "404"},
                         )
                         return
                 elif self.cfg.full_logs:
@@ -205,17 +290,15 @@ class BruteOrchestrator:
             if pub_ip:
                 break
 
-        await self.notify.live(
-            "\n".join(
-                [
-                    "🖥 " + bold("Live — облачная ВМ"),
-                    "┈ " + bold("Аккаунт") + f" {code(name)}",
-                    "┈ " + bold("ВМ") + f" {code(vm_name)}",
-                    "┈ " + bold("Регион") + f" {code(region)}",
-                    "┈ " + bold("IPv4") + f" {code(pub_ip or '—')}",
-                ]
-            )
-        )
+        live_vm = [
+            "🖥 " + bold("Live — облачная ВМ"),
+            "┈ " + bold("Аккаунт") + f" {code(name)}",
+            "┈ " + bold("ВМ") + f" {code(vm_name)}",
+            "┈ " + bold("Регион") + f" {code(region)}",
+            "┈ " + bold("IPv4") + f" {code(pub_ip or '—')}",
+        ]
+        live_vm.extend(self._ip_live_extra_lines(pub_ip))
+        await self.notify.live("\n".join(live_vm))
 
         if not pub_ip:
             if notfound_streak >= NOTFOUND_GIVEUP:
@@ -241,6 +324,7 @@ class BruteOrchestrator:
         if ipv4_in_pool(pub_ip, self._networks):
             await self.stats.add_pool_hit()
             await self.db.patch_account(name, {"brute_enabled": 0})
+            await self.db.append_whitelist_server(name, server_id)
             await self.db.log_event("pool_hit", name, {"ip": pub_ip, "server_id": server_id})
             login_line = f"root@{pub_ip}"
             pass_block = spoiler_code(root_pass) if root_pass else code("—")
@@ -251,6 +335,7 @@ class BruteOrchestrator:
                     "┈ " + bold("Аккаунт") + f" {code(name)}",
                     "┈ " + bold("SSH login") + f" {code(login_line)}",
                     "┈ " + bold("Пароль root") + f" {pass_block}",
+                    "┈ " + bold("ВМ id") + f" {code(str(server_id))} — в белом списке, авто-выключение по таймеру",
                 ]
             )
             await self.notify.totalresult(msg)
@@ -270,7 +355,7 @@ class BruteOrchestrator:
             await self.db.log_event("ip_not_in_pool", name, {"ip": pub_ip, "server_id": server_id})
 
     async def _run_brute_floating_ip(self, name: str, row: AccountRow) -> None:
-        await self.stats.track_account(name)
+        await self.stats.track_account(name, row.balance_cached)
         if self.cfg.full_logs:
             await self.notify.logs(f"{bold('TWC')} плавающий IP · {esc(name)} (баланс выше порога)")
 
@@ -307,7 +392,7 @@ class BruteOrchestrator:
             await self.db.log_event("float_ip_create_fail", name, {"zones": list(TWC_FLOAT_IP_ZONES)})
             return
 
-        await self.stats.add_vm_ok()
+        await self.stats.add_float_ok()
         fi = floating_ip_record_from_response(data)
         if not fi:
             await self.stats.add_vm_fail()
@@ -333,6 +418,19 @@ class BruteOrchestrator:
                 if isinstance(inner, dict):
                     pub_ip = extract_ipv4_from_floating_record(inner)
             except TimewebApiError as ex:
+                pmsg = parse_error_message(ex)
+                if looks_like_daily_limit_error(pmsg) or ex.status == 429:
+                    await self.db.patch_account(
+                        name,
+                        {"limited_by_day": 1, "limited_by_day_ts": time.time()},
+                    )
+                    await self.stats.add_cooldown24()
+                    await self.db.log_event("daily_limit_float", name, {"msg": pmsg[:800]})
+                    try:
+                        await self.twc.delete_floating_ip(row.api_key, fid)
+                    except Exception:
+                        pass
+                    return
                 if is_floating_ip_not_found(ex):
                     notfound_streak += 1
                     if notfound_streak >= NOTFOUND_GIVEUP:
@@ -358,16 +456,14 @@ class BruteOrchestrator:
                 if self.cfg.full_logs:
                     await self.notify.logs(f"{bold('poll float ip')} {esc(name)}: {esc(str(ex)[:200])}")
 
-        await self.notify.live(
-            "\n".join(
-                [
-                    "📡 " + bold("Live — плавающий публичный IPv4"),
-                    "┈ " + bold("Аккаунт") + f" {code(name)}",
-                    "┈ " + bold("Зона доступности") + f" {code(zone_used)}",
-                    "┈ " + bold("📡IPv4-Address:") + f" {code(pub_ip or '—')}",
-                ]
-            )
-        )
+        live_f = [
+            "📡 " + bold("Live — плавающий публичный IPv4"),
+            "┈ " + bold("Аккаунт") + f" {code(name)}",
+            "┈ " + bold("Зона доступности") + f" {code(zone_used)}",
+            "┈ " + bold("📡IPv4-Address:") + f" {code(pub_ip or '—')}",
+        ]
+        live_f.extend(self._ip_live_extra_lines(pub_ip))
+        await self.notify.live("\n".join(live_f))
 
         if not pub_ip:
             if notfound_streak >= NOTFOUND_GIVEUP:
@@ -390,6 +486,7 @@ class BruteOrchestrator:
         if ipv4_in_pool(pub_ip, self._networks):
             await self.stats.add_pool_hit()
             await self.db.patch_account(name, {"brute_enabled": 0})
+            await self.db.append_whitelist_float(name, fid)
             await self.db.log_event(
                 "pool_hit_float",
                 name,
@@ -402,6 +499,7 @@ class BruteOrchestrator:
                     "┈ " + bold("Аккаунт") + f" {code(name)}",
                     "┈ " + bold("Тип") + " плавающий публичный IP (Timeweb)",
                     "┈ " + bold("Зона") + f" {code(zone_used)}",
+                    "┈ " + bold("Float id") + f" {code(fid)} — в белом списке, авто-удаление по таймеру отменяется",
                 ]
             )
             await self.notify.totalresult(msg)
@@ -427,6 +525,14 @@ class BruteOrchestrator:
     async def _delete_float_later(self, api_key: str, floating_ip_id: str, acc_name: str) -> None:
         delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
         await asyncio.sleep(delay)
+        row = await self.db.get_account(acc_name)
+        if row and floating_ip_id in self.db.whitelist_float_ids(row):
+            await self.notify.logs(
+                "🔒 "
+                + bold("Плавающий IP в белом списке")
+                + f" {code(floating_ip_id)} — удаление по таймеру отменено."
+            )
+            return
         try:
             await self.twc.delete_floating_ip(api_key, floating_ip_id)
             await self.notify.logs(

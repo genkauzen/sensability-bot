@@ -66,6 +66,7 @@ class Config:
     data_dir: Path
     compose_dir: Path
     subnets_path: Path
+    potential_subnets_path: Path
 
 
 def _resolve_compose_dir(package_root: Path) -> Path:
@@ -94,6 +95,7 @@ def load_config() -> Config:
     data_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parent.parent
     subnets = Path(os.getenv("SENSABILITY_SUBNETS_PATH", str(root / "subnets.txt")))
+    potential = Path(os.getenv("SENSABILITY_POTENTIAL_SUBNETS_PATH", str(root / "potential_subnets.txt")))
     compose = _resolve_compose_dir(root)
 
     return Config(
@@ -124,4 +126,5 @@ def load_config() -> Config:
         data_dir=data_dir,
         compose_dir=compose,
         subnets_path=subnets,
+        potential_subnets_path=potential,
     )

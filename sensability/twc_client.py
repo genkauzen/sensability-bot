@@ -20,6 +20,11 @@ MONTH_BALANCE_ERR_RE = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
+DAILY_LIMIT_ERR_RE = re.compile(
+    r"daily\s*limit|лимит.*сутк|суточн.*лимит|per\s*day|rate\s*limit",
+    re.IGNORECASE | re.UNICODE,
+)
+
 
 class TimewebApiError(Exception):
     def __init__(self, status: int, body: str, parsed: dict | None = None) -> None:
@@ -27,6 +32,15 @@ class TimewebApiError(Exception):
         self.status = status
         self.body = body
         self.parsed = parsed
+
+
+def looks_like_daily_limit_error(message: str) -> bool:
+    if not message:
+        return False
+    if DAILY_LIMIT_ERR_RE.search(message):
+        return True
+    low = message.lower()
+    return "daily limit" in low or "лимит запросов" in low
 
 
 def looks_like_month_balance_error(message: str) -> bool:
@@ -155,6 +169,26 @@ class TimewebClient:
     async def delete_floating_ip(self, api_key: str, floating_ip_id: str) -> None:
         await self._request("DELETE", f"/api/v1/floating-ips/{floating_ip_id}", api_key)
 
+    async def list_servers(self, api_key: str) -> dict[str, Any]:
+        data = await self._request("GET", "/api/v1/servers", api_key)
+        assert isinstance(data, dict)
+        return data
+
+    async def list_floating_ips(self, api_key: str) -> dict[str, Any]:
+        data = await self._request("GET", "/api/v1/floating-ips", api_key)
+        assert isinstance(data, dict)
+        return data
+
+    async def add_server_ipv4(self, api_key: str, server_id: int) -> dict[str, Any]:
+        data = await self._request(
+            "POST",
+            f"/api/v1/servers/{server_id}/ips",
+            api_key,
+            json_body={"type": "ipv4"},
+        )
+        assert isinstance(data, dict)
+        return data
+
 
 def floating_ip_record_from_response(data: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(data, dict):
@@ -250,12 +284,64 @@ def is_server_not_found(exc: Exception) -> bool:
     return False
 
 
-def deep_find_email(obj: Any) -> str | None:
+def deep_find_full_name(obj: Any) -> str | None:
+    """ФИО / имя из ЛК (личные данные, profile и т.п.)."""
     if isinstance(obj, dict):
+        pd = obj.get("personal_data") or obj.get("personal") or obj.get("profile")
+        if isinstance(pd, dict):
+            sub = deep_find_full_name(pd)
+            if sub:
+                return sub
+        for key in ("full_name", "fio", "name", "client_name", "display_name"):
+            v = obj.get(key)
+            if isinstance(v, str) and len(v.strip()) > 1 and "@" not in v:
+                return v.strip()
+        fn = obj.get("first_name") or obj.get("firstname")
+        ln = obj.get("last_name") or obj.get("lastname")
+        if isinstance(fn, str) and isinstance(ln, str):
+            s = f"{fn.strip()} {ln.strip()}".strip()
+            if s:
+                return s
+        if isinstance(fn, str) and fn.strip():
+            return fn.strip()
         for k, v in obj.items():
             lk = str(k).lower()
-            if lk in ("email", "e_mail", "mail") and isinstance(v, str) and "@" in v:
-                return v
+            if "personal" in lk or "profile" in lk or "fio" in lk or "данн" in lk:
+                sub = deep_find_full_name(v)
+                if sub:
+                    return sub
+    elif isinstance(obj, list):
+        for it in obj:
+            sub = deep_find_full_name(it)
+            if sub:
+                return sub
+    return None
+
+
+def deep_find_email(obj: Any) -> str | None:
+    priority_keys = (
+        "email",
+        "e_mail",
+        "user_email",
+        "contact_email",
+        "primary_email",
+        "mail",
+        "login_email",
+    )
+    if isinstance(obj, dict):
+        for pk in priority_keys:
+            v = obj.get(pk)
+            if isinstance(v, str) and "@" in v:
+                s = v.strip()
+                if s:
+                    return s
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if "email" in lk and isinstance(v, str) and "@" in v:
+                s = v.strip()
+                if s:
+                    return s
+        for k, v in obj.items():
             sub = deep_find_email(v)
             if sub:
                 return sub

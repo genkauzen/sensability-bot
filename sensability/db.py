@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     limited_by_day_ts REAL,
     balance_cached REAL,
     currency TEXT,
-    last_sync_ts REAL
+    last_sync_ts REAL,
+    acc_full_name TEXT,
+    whitelist_servers TEXT,
+    whitelist_floats TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -54,6 +57,9 @@ class AccountRow:
     balance_cached: float | None
     currency: str | None
     last_sync_ts: float | None
+    acc_full_name: str | None
+    whitelist_servers: str | None
+    whitelist_floats: str | None
 
 
 def _row_to_account(r: aiosqlite.Row) -> AccountRow:
@@ -71,7 +77,17 @@ def _row_to_account(r: aiosqlite.Row) -> AccountRow:
         balance_cached=r["balance_cached"],
         currency=r["currency"],
         last_sync_ts=r["last_sync_ts"],
+        acc_full_name=_col(r, "acc_full_name"),
+        whitelist_servers=_col(r, "whitelist_servers"),
+        whitelist_floats=_col(r, "whitelist_floats"),
     )
+
+
+def _col(r: aiosqlite.Row, key: str) -> Any:
+    try:
+        return r[key]
+    except (KeyError, IndexError):
+        return None
 
 
 class Database:
@@ -82,7 +98,20 @@ class Database:
         self._db = await aiosqlite.connect(self._path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
+        await self._migrate_accounts_columns()
         await self._db.commit()
+
+    async def _migrate_accounts_columns(self) -> None:
+        cur = await self._db.execute("PRAGMA table_info(accounts)")
+        rows = await cur.fetchall()
+        have = {str(r[1]) for r in rows}
+        for col, sql_typ in (
+            ("acc_full_name", "TEXT"),
+            ("whitelist_servers", "TEXT"),
+            ("whitelist_floats", "TEXT"),
+        ):
+            if col not in have:
+                await self._db.execute(f"ALTER TABLE accounts ADD COLUMN {col} {sql_typ}")
 
     async def close(self) -> None:
         await self._db.close()
@@ -145,6 +174,9 @@ class Database:
                 "limited_by_day",
                 "limited_by_day_ts",
                 "brute_enabled",
+                "acc_full_name",
+                "whitelist_servers",
+                "whitelist_floats",
             }
         )
         fields = {k: v for k, v in fields.items() if k in allowed}
@@ -177,6 +209,59 @@ class Database:
         )
         await self._db.commit()
         return cur.rowcount > 0
+
+    async def append_whitelist_server(self, name: str, server_id: int) -> None:
+        row = await self.get_account(name)
+        if not row:
+            return
+        cur: list[Any]
+        try:
+            cur = json.loads(row.whitelist_servers or "[]")
+        except json.JSONDecodeError:
+            cur = []
+        if not isinstance(cur, list):
+            cur = []
+        if server_id not in cur:
+            cur.append(server_id)
+        await self.patch_account(name, {"whitelist_servers": json.dumps(cur)})
+
+    async def append_whitelist_float(self, name: str, floating_ip_id: str) -> None:
+        row = await self.get_account(name)
+        if not row:
+            return
+        try:
+            cur = json.loads(row.whitelist_floats or "[]")
+        except json.JSONDecodeError:
+            cur = []
+        if not isinstance(cur, list):
+            cur = []
+        if floating_ip_id not in cur:
+            cur.append(floating_ip_id)
+        await self.patch_account(name, {"whitelist_floats": json.dumps(cur)})
+
+    def whitelist_server_ids(self, row: AccountRow) -> list[int]:
+        try:
+            raw = json.loads(row.whitelist_servers or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        out: list[int] = []
+        for x in raw:
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def whitelist_float_ids(self, row: AccountRow) -> list[str]:
+        try:
+            raw = json.loads(row.whitelist_floats or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [str(x) for x in raw if x is not None]
 
     async def log_event(self, kind: str, account: str | None, detail: Any) -> None:
         payload = json.dumps(detail, ensure_ascii=False) if not isinstance(detail, str) else detail

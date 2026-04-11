@@ -9,23 +9,29 @@ from dataclasses import dataclass, field
 class DailyStats:
     pool_hits: int = 0
     vm_created_ok: int = 0
+    float_created_ok: int = 0
     vm_created_fail: int = 0
     vm_deleted_no_pool: int = 0
     cooldown_24h_accounts: int = 0
     month_balance_errors: int = 0
     ipv4_checks: int = 0
     accounts_used: set[str] = field(default_factory=set)
+    balance_min: float | None = None
+    balance_max: float | None = None
     started_at: float = field(default_factory=time.time)
 
     def reset(self) -> None:
         self.pool_hits = 0
         self.vm_created_ok = 0
+        self.float_created_ok = 0
         self.vm_created_fail = 0
         self.vm_deleted_no_pool = 0
         self.cooldown_24h_accounts = 0
         self.month_balance_errors = 0
         self.ipv4_checks = 0
         self.accounts_used.clear()
+        self.balance_min = None
+        self.balance_max = None
         self.started_at = time.time()
 
 
@@ -45,6 +51,10 @@ class StatsCollector:
     async def add_vm_ok(self) -> None:
         async with self._lock:
             self._d.vm_created_ok += 1
+
+    async def add_float_ok(self) -> None:
+        async with self._lock:
+            self._d.float_created_ok += 1
 
     async def add_vm_fail(self) -> None:
         async with self._lock:
@@ -66,9 +76,14 @@ class StatsCollector:
         async with self._lock:
             self._d.ipv4_checks += 1
 
-    async def track_account(self, name: str) -> None:
+    async def track_account(self, name: str, balance: float | None = None) -> None:
         async with self._lock:
             self._d.accounts_used.add(name)
+            if balance is not None:
+                if self._d.balance_min is None or balance < self._d.balance_min:
+                    self._d.balance_min = balance
+                if self._d.balance_max is None or balance > self._d.balance_max:
+                    self._d.balance_max = balance
 
     async def reset_day(self) -> None:
         async with self._lock:

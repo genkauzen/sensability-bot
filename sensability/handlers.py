@@ -15,14 +15,19 @@ from zoneinfo import ZoneInfo
 from sensability.account_sync import account_prefers_floating_ip_probe, sync_account
 from sensability.brute_worker import BruteOrchestrator
 from sensability.config import Config
-from sensability.db import Database
+from sensability.db import AccountRow, Database
 from sensability.docker_ops import compose_command, compose_dir_ok
 from sensability.ip_pool import load_networks
 from sensability.notify import TelegramNotify
 from sensability.report import build_daily_report
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, code, esc
-from sensability.twc_client import TimewebClient, finances_balance_rubles
+from sensability.twc_client import (
+    TimewebClient,
+    extract_ipv4_from_server,
+    finances_balance_rubles,
+    floating_ip_record_from_response,
+)
 
 if TYPE_CHECKING:
     pass
@@ -36,6 +41,83 @@ RE_ACCOUNT_DISABLE = re.compile(r"^/(?:account_disable|accont_disable)\s+(\S+)\s
 RE_ACCOUNT_ENABLE = re.compile(r"^/account_enable\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_HEAL = re.compile(r"^/account_heal\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_MNG = re.compile(r"^/account_mng\s+(\S+)(?:\s+(.*))?$", re.I)
+
+
+def _twc_account_resources_lines(
+    db: Database,
+    row: AccountRow,
+    servers_payload: dict[str, Any],
+    floats_payload: dict[str, Any],
+) -> list[str]:
+    w_srv = set(db.whitelist_server_ids(row))
+    w_fl = set(db.whitelist_float_ids(row))
+    lines: list[str] = []
+    srvs = servers_payload.get("servers") if isinstance(servers_payload, dict) else None
+    if not isinstance(srvs, list):
+        srvs = []
+    lines.append("┈ " + bold("ВМ в облаке") + f" ({code(str(len(srvs)))})")
+    for s in srvs[:40]:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id")
+        try:
+            sid_i = int(sid) if sid is not None else 0
+        except (TypeError, ValueError):
+            sid_i = 0
+        nm = str(s.get("name") or "—")
+        st = str(s.get("status") or s.get("state") or "—")
+        z = str(s.get("availability_zone") or "—")
+        ips = extract_ipv4_from_server(s)
+        ip_s = ", ".join(ips) if ips else "—"
+        wl = " · 🔒 белый список" if sid_i and sid_i in w_srv else ""
+        lines.append(
+            f"   • id {code(str(sid))} {code(nm)} · {esc(st)} · {esc(z)} · IPv4 {code(ip_s)}{wl}"
+        )
+    if len(srvs) > 40:
+        lines.append("   … " + bold("ещё") + f" {code(str(len(srvs) - 40))}")
+
+    fl_raw = (
+        floats_payload.get("floating_ips") or floats_payload.get("ips")
+        if isinstance(floats_payload, dict)
+        else None
+    )
+    if not isinstance(fl_raw, list):
+        fl_raw = []
+    lines.append("┈ " + bold("Плавающие IPv4") + f" ({code(str(len(fl_raw)))})")
+    for f in fl_raw[:40]:
+        if not isinstance(f, dict):
+            continue
+        inner = floating_ip_record_from_response(f) or f
+        if not isinstance(inner, dict):
+            continue
+        fid = str(inner.get("id") or f.get("id") or "").strip() or "—"
+        addr = inner.get("ip")
+        if isinstance(addr, dict):
+            addr = addr.get("ip")
+        addr_s = str(addr).strip() if addr else "—"
+        st = str(inner.get("status") or f.get("status") or "—")
+        z = str(inner.get("availability_zone") or f.get("availability_zone") or "—")
+        wl = " · 🔒 белый список" if fid in w_fl else ""
+        lines.append(f"   • {code(fid)} · {code(addr_s)} · {esc(st)} · {esc(z)}{wl}")
+    if len(fl_raw) > 40:
+        lines.append("   … " + bold("ещё") + f" {code(str(len(fl_raw) - 40))}")
+    return lines
+
+
+async def _twc_account_resources_block(db: Database, twc: TimewebClient, row: AccountRow) -> list[str]:
+    srv_pl: dict[str, Any] = {}
+    fl_pl: dict[str, Any] = {}
+    errs: list[str] = []
+    try:
+        srv_pl = await twc.list_servers(row.api_key)
+    except Exception as ex:
+        errs.append("┈ " + bold("ВМ (API)") + f": ❌ {esc(str(ex)[:280])}")
+    try:
+        fl_pl = await twc.list_floating_ips(row.api_key)
+    except Exception as ex:
+        errs.append("┈ " + bold("Плавающие IP (API)") + f": ❌ {esc(str(ex)[:280])}")
+    rest = _twc_account_resources_lines(db, row, srv_pl, fl_pl)
+    return errs + rest
 
 
 def _uid(update: Update) -> str | None:
@@ -71,6 +153,7 @@ def _split_name_key(arg: str) -> tuple[str | None, str | None]:
 async def handle_account_terminal_commands(
     cfg: Config,
     db: Database,
+    twc: TimewebClient,
     text: str,
     reply: Callable[[str], Awaitable[None]],
 ) -> bool:
@@ -144,7 +227,11 @@ async def handle_account_terminal_commands(
             applied.append("💳 " + bold("Флаг «мало баланса» снят") + " (-balance)")
         else:
             unknown.append(fl)
-    row = await db.get_account(name)
+    try:
+        synced = await sync_account(db, twc, cfg, name)
+        row = synced if synced else await db.get_account(name)
+    except Exception:
+        row = await db.get_account(name)
     assert row is not None
     now = time.time()
     left_day = "—"
@@ -161,10 +248,12 @@ async def handle_account_terminal_commands(
         if account_prefers_floating_ip_probe(row)
         else "🖥 облачная ВМ"
     )
+    res_lines = await _twc_account_resources_block(db, twc, row)
     panel = "\n".join(
         [
             "🪪 " + bold("Управление аккаунтом") + f" {code(name)}",
             "┈ " + bold("Email") + f": {code(row.acc_email or '—')}",
+            "┈ " + bold("ФИО (личные данные)") + f": {code(row.acc_full_name or '—')}",
             "┈ " + bold("Login") + f": {code(row.acc_login or '—')}",
             "┈ " + bold("Баланс") + f": {code(bal_s)} {esc(row.currency or '')}",
             "┈ " + bold("Режим перебора") + f": {mode_ip}",
@@ -172,6 +261,8 @@ async def handle_account_terminal_commands(
             "┈ " + bold("Лимит баланса") + f": {'⚠️ да' if row.limited_by_balance else '✅ нет'}",
             "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
             "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
+            "",
+            *res_lines,
             "",
             bold("Флаги") + ": "
             + code("-on")
@@ -316,7 +407,7 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     async def _acc_reply(html: str) -> None:
         await notify.terminal_reply(tid, html)
 
-    if await handle_account_terminal_commands(cfg, db, text, _acc_reply):
+    if await handle_account_terminal_commands(cfg, db, twc, text, _acc_reply):
         return
 
     if low == "/modules":
@@ -446,7 +537,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
     async def _vreply(html: str) -> None:
         await notify.accountverify_reply(tid, html)
 
-    if await handle_account_terminal_commands(cfg, db, text, _vreply):
+    if await handle_account_terminal_commands(cfg, db, twc, text, _vreply):
         return
 
     m = RE_ACCOUNT_ADD.match(text)
@@ -465,6 +556,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         row = await sync_account(db, twc, cfg, name)
         em = row.acc_email if row else None
         lg = row.acc_login if row else None
+        fn = row.acc_full_name if row else None
         await notify.accountverify_reply(
             tid,
             "\n".join(
@@ -472,6 +564,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                     "✅ " + bold("Аккаунт подключён"),
                     "┈ " + bold("Имя в боте") + f" {code(name)}",
                     "┈ " + bold("Email") + f" {code(em or '—')}",
+                    "┈ " + bold("ФИО") + f" {code(fn or '—')}",
                     "┈ " + bold("Login") + f" {code(lg or '—')}",
                     "┈ " + bold("Баланс") + f" {code(str(bal))} {esc(cur or '')}",
                 ]
@@ -486,6 +579,12 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         if not row:
             await notify.accountverify_reply(tid, "Не найден: " + code(name))
             return
+        try:
+            synced = await sync_account(db, twc, cfg, name)
+            if synced:
+                row = synced
+        except Exception:
+            pass
         now = time.time()
         left_day = "—"
         if row.limited_by_day and row.limited_by_day_ts:
@@ -501,10 +600,12 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             if account_prefers_floating_ip_probe(row)
             else "🖥 облачная ВМ"
         )
+        res_lines = await _twc_account_resources_block(db, twc, row)
         body = "\n".join(
             [
                 "🪪 " + bold("Карточка аккаунта") + f" {code(name)}",
                 "┈ " + bold("Email") + f": {code(row.acc_email or '—')}",
+                "┈ " + bold("ФИО (личные данные)") + f": {code(row.acc_full_name or '—')}",
                 "┈ " + bold("Login") + f": {code(row.acc_login or '—')}",
                 "┈ " + bold("Баланс") + f": {code(bal_s)} {esc(row.currency or '')}",
                 "┈ " + bold("Режим перебора") + f": {mode_ip}",
@@ -512,6 +613,8 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                 "┈ " + bold("Лимит баланса") + f": {'⚠️ да' if row.limited_by_balance else '✅ нет'}",
                 "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
                 "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
+                "",
+                *res_lines,
             ]
         )
         await notify.accountverify_reply(tid, body)
