@@ -32,8 +32,3 @@ def location_for_availability_zone(zone: str) -> str | None:
     if z.startswith("msk-"):
         return "ru-1"
     return None
-
-
-def create_server_network_for_public_ipv4() -> dict:
-    """Один запрос на создание: явно запрашиваем публичный (floating) IPv4 в сети ВМ."""
-    return {"floating_ip": True}

@@ -17,7 +17,6 @@ from sensability.twc_constants import (
     TWC_BANDWIDTH,
     TWC_OS_ID,
     TWC_PRESET_ID,
-    create_server_network_for_public_ipv4,
     location_for_availability_zone,
 )
 from sensability.twc_client import (
@@ -79,7 +78,6 @@ class BruteOrchestrator:
             "is_local_network": False,
             "comment": "sensability",
             "availability_zone": zone,
-            "network": create_server_network_for_public_ipv4(),
         }
         if loc:
             body["location"] = loc
