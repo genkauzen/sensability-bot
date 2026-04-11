@@ -5,13 +5,14 @@ import logging
 import re
 import time
 from datetime import datetime, time as dtime
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from telegram import Update
 from telegram.ext import ContextTypes
 from zoneinfo import ZoneInfo
 
-from sensability.account_sync import sync_account
+from sensability.account_sync import account_prefers_floating_ip_probe, sync_account
 from sensability.brute_worker import BruteOrchestrator
 from sensability.config import Config
 from sensability.db import Database
@@ -34,6 +35,7 @@ RE_ACCOUNT_DEL = re.compile(r"^/account_del\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_DISABLE = re.compile(r"^/(?:account_disable|accont_disable)\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_ENABLE = re.compile(r"^/account_enable\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_HEAL = re.compile(r"^/account_heal\s+(\S+)\s*$", re.I)
+RE_ACCOUNT_MNG = re.compile(r"^/account_mng\s+(\S+)(?:\s+(.*))?$", re.I)
 
 
 def _uid(update: Update) -> str | None:
@@ -64,6 +66,134 @@ def _split_name_key(arg: str) -> tuple[str | None, str | None]:
     if not name or not key:
         return None, None
     return name, key
+
+
+async def handle_account_terminal_commands(
+    cfg: Config,
+    db: Database,
+    text: str,
+    reply: Callable[[str], Awaitable[None]],
+) -> bool:
+    """Команды /account_list и /account_mng … — для терминала и топика verify. Возвращает True, если обработано."""
+    raw = text.strip()
+    low = raw.lower()
+    if low == "/account_list":
+        rows = await db.list_accounts()
+        if not rows:
+            await reply("📭 " + bold("Аккаунты") + " — пока пусто.")
+            return True
+        lines = [
+            "📋 " + bold("Список аккаунтов Timeweb") + f" · {code(str(len(rows)))} шт.",
+            "",
+        ]
+        for r in rows[:60]:
+            bal = "—" if r.balance_cached is None else f"{r.balance_cached:g}"
+            cur = esc(r.currency or "")
+            be = "🟢" if r.brute_enabled else "⚫"
+            lim = []
+            if r.limited_by_balance:
+                lim.append("баланс")
+            if r.limited_by_month:
+                lim.append("месяц")
+            if r.limited_by_day:
+                lim.append("сутки")
+            lim_s = (" · ⚠️ " + ", ".join(lim)) if lim else ""
+            lines.append(f"{be} {code(r.name)} · 💰 {code(bal)} {cur}{lim_s}")
+        if len(rows) > 60:
+            lines.append("")
+            lines.append("… " + bold("ещё") + f" {code(str(len(rows) - 60))} — уточните по имени.")
+        await reply("\n".join(lines))
+        return True
+    m = RE_ACCOUNT_MNG.match(raw)
+    if not m:
+        return False
+    name = m.group(1).strip()
+    rest = (m.group(2) or "").strip()
+    flags = [x for x in rest.split() if x]
+    row = await db.get_account(name)
+    if not row:
+        await reply("❌ " + bold("Аккаунт не найден") + f": {code(name)}")
+        return True
+    applied: list[str] = []
+    unknown: list[str] = []
+    for fl in flags:
+        t = fl.lower()
+        if t in ("-on", "-brute", "-brute_on"):
+            await db.set_brute_enabled(name, True)
+            applied.append("🟢 перебор " + bold("включён") + " (-on)")
+        elif t in ("-off", "-brute_off"):
+            await db.set_brute_enabled(name, False)
+            applied.append("⚫ перебор " + bold("выключен") + " (-off)")
+        elif t == "-heal":
+            await db.heal_account(name)
+            applied.append("🩹 " + bold("Все лимиты сброшены") + " (-heal)")
+        elif t in ("-day", "-clearday"):
+            await db.patch_account(
+                name,
+                {"limited_by_day": 0, "limited_by_day_ts": None},
+            )
+            applied.append("📅 " + bold("Суточный лимит снят") + " (-day)")
+        elif t in ("-month", "-clearmonth"):
+            await db.patch_account(
+                name,
+                {"limited_by_month": 0, "limited_by_month_ts": None},
+            )
+            applied.append("📆 " + bold("Месячный лимит снят") + " (-month)")
+        elif t in ("-balance", "-balanceok", "-unlimit_balance"):
+            await db.patch_account(name, {"limited_by_balance": 0})
+            applied.append("💳 " + bold("Флаг «мало баланса» снят") + " (-balance)")
+        else:
+            unknown.append(fl)
+    row = await db.get_account(name)
+    assert row is not None
+    now = time.time()
+    left_day = "—"
+    if row.limited_by_day and row.limited_by_day_ts:
+        left = max(0, int(row.limited_by_day_ts + 86400 - now))
+        left_day = f"{left // 3600}ч {(left % 3600) // 60}м"
+    left_m = "—"
+    if row.limited_by_month and row.limited_by_month_ts:
+        lm = max(0, int(row.limited_by_month_ts + 3600 - now))
+        left_m = f"{lm // 60}м {lm % 60}с"
+    bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
+    mode_ip = (
+        "📡 плавающий IPv4 (без ВМ)"
+        if account_prefers_floating_ip_probe(row)
+        else "🖥 облачная ВМ"
+    )
+    panel = "\n".join(
+        [
+            "🪪 " + bold("Управление аккаунтом") + f" {code(name)}",
+            "┈ " + bold("Email") + f": {code(row.acc_email or '—')}",
+            "┈ " + bold("Login") + f": {code(row.acc_login or '—')}",
+            "┈ " + bold("Баланс") + f": {code(bal_s)} {esc(row.currency or '')}",
+            "┈ " + bold("Режим перебора") + f": {mode_ip}",
+            "┈ " + bold("В подборе") + f": {'✅ да' if row.brute_enabled else '❌ нет'}",
+            "┈ " + bold("Лимит баланса") + f": {'⚠️ да' if row.limited_by_balance else '✅ нет'}",
+            "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
+            "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
+            "",
+            bold("Флаги") + ": "
+            + code("-on")
+            + " / "
+            + code("-off")
+            + " · "
+            + code("-heal")
+            + " · "
+            + code("-day")
+            + " · "
+            + code("-month")
+            + " · "
+            + code("-balance"),
+        ]
+    )
+    extra = ""
+    if applied:
+        extra = "\n\n" + bold("Выполнено") + "\n" + "\n".join(applied)
+    if unknown:
+        extra += "\n\n⚠️ " + bold("Не распознано") + ": " + ", ".join(code(u) for u in unknown)
+    await reply(panel + extra)
+    return True
 
 
 def _ctx(application: Any) -> tuple[Config, Database, TimewebClient, StatsCollector, TelegramNotify, BruteOrchestrator]:
@@ -114,6 +244,8 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 "/debug — лог TWC API: полные запрос и ответ (в blockquote)",
                 "/debug -mid — краткий лог (зона, параметры ВМ, суть ответа)",
                 "/debug -low — отключить лог TWC",
+                "/account_list — список аккаунтов Timeweb",
+                "/account_mng имя — карточка и флаги: -on -off -heal -day -month -balance",
                 "/drop — docker compose down",
                 "/restart — пересоздать контейнеры (force-recreate)",
                 "/rebuild — build --no-cache + up force-recreate",
@@ -179,6 +311,12 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             + "Сообщения идут в топик терминала (как и этот чат)."
             + warn,
         )
+        return
+
+    async def _acc_reply(html: str) -> None:
+        await notify.terminal_reply(tid, html)
+
+    if await handle_account_terminal_commands(cfg, db, text, _acc_reply):
         return
 
     if low == "/modules":
@@ -305,6 +443,12 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
     cfg, db, twc, stats, notify, _orch = _ctx(context.application)
     tid = update.message.message_thread_id if update.message else None
 
+    async def _vreply(html: str) -> None:
+        await notify.accountverify_reply(tid, html)
+
+    if await handle_account_terminal_commands(cfg, db, text, _vreply):
+        return
+
     m = RE_ACCOUNT_ADD.match(text)
     if m:
         name, key = _split_name_key(m.group(1))
@@ -318,12 +462,20 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             await notify.accountverify_reply(tid, f"❌ API ключ не подошёл: {esc(str(ex)[:400])}")
             return
         await db.add_account(name, key)
-        await sync_account(db, twc, cfg, name)
+        row = await sync_account(db, twc, cfg, name)
+        em = row.acc_email if row else None
+        lg = row.acc_login if row else None
         await notify.accountverify_reply(
             tid,
-            "✅ "
-            + bold("Аккаунт добавлен")
-            + f"\nИмя: {code(name)}\nБаланс: {code(str(bal))} {esc(cur or '')}",
+            "\n".join(
+                [
+                    "✅ " + bold("Аккаунт подключён"),
+                    "┈ " + bold("Имя в боте") + f" {code(name)}",
+                    "┈ " + bold("Email") + f" {code(em or '—')}",
+                    "┈ " + bold("Login") + f" {code(lg or '—')}",
+                    "┈ " + bold("Баланс") + f" {code(str(bal))} {esc(cur or '')}",
+                ]
+            ),
         )
         return
 
@@ -343,17 +495,23 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         if row.limited_by_month and row.limited_by_month_ts:
             lm = max(0, int(row.limited_by_month_ts + 3600 - now))
             left_m = f"{lm // 60}м {lm % 60}с"
+        bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
+        mode_ip = (
+            "📡 плавающий IPv4 (без ВМ)"
+            if account_prefers_floating_ip_probe(row)
+            else "🖥 облачная ВМ"
+        )
         body = "\n".join(
             [
-                bold("Аккаунт") + f" {code(name)}",
-                f"login: {code(row.acc_login or '—')}",
-                f"email: {code(row.acc_email or '—')}",
-                f"limitedByBalance: {code(str(row.limited_by_balance))}",
-                f"limitedByMonthBalanceError: {code(str(row.limited_by_month))} (осталось ~{left_m})",
-                f"limitedByPerDay: {code(str(row.limited_by_day))}",
-                f"limitedByPerDay осталось: {code(left_day)}",
-                f"В пуле перебора: {code(str(row.brute_enabled))}",
-                f"Баланс (кэш): {code(str(row.balance_cached))} {esc(row.currency or '')}",
+                "🪪 " + bold("Карточка аккаунта") + f" {code(name)}",
+                "┈ " + bold("Email") + f": {code(row.acc_email or '—')}",
+                "┈ " + bold("Login") + f": {code(row.acc_login or '—')}",
+                "┈ " + bold("Баланс") + f": {code(bal_s)} {esc(row.currency or '')}",
+                "┈ " + bold("Режим перебора") + f": {mode_ip}",
+                "┈ " + bold("В подборе") + f": {'✅ да' if row.brute_enabled else '❌ нет'}",
+                "┈ " + bold("Лимит баланса") + f": {'⚠️ да' if row.limited_by_balance else '✅ нет'}",
+                "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
+                "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
             ]
         )
         await notify.accountverify_reply(tid, body)
@@ -385,11 +543,16 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await notify.accountverify_reply(
         tid,
-        "Команды: "
-        + code("/account_add имя:ключ")
-        + ", "
-        + code("/account_info имя")
-        + ", …",
+        "\n".join(
+            [
+                bold("Команды аккаунтов"),
+                code("/account_add имя:ключ"),
+                code("/account_info имя"),
+                code("/account_list"),
+                code("/account_mng имя") + " и флаги " + code("-on -off -heal -day -month -balance"),
+                code("/account_del имя") + " · " + code("/account_enable") + " / " + code("/account_disable"),
+            ]
+        ),
     )
 
 

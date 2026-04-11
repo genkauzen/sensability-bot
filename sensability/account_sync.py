@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.jwt_util import jwt_payload_unverified
+from sensability.twc_constants import TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB
 from sensability.twc_client import TimewebClient, deep_find_email, finances_balance_rubles
 
 if TYPE_CHECKING:
@@ -68,6 +69,16 @@ async def sync_account(db: Database, twc: TimewebClient, cfg: Config, name: str)
     await db.patch_account(name, patch)
     out = await db.get_account(name)
     return out
+
+
+def account_prefers_floating_ip_probe(row: AccountRow) -> bool:
+    """Баланс выше порога в рублях — перебор через заказ плавающего IPv4 (без ВМ)."""
+    if row.balance_cached is None:
+        return False
+    cur = (row.currency or "").strip().upper()
+    if cur and cur not in ("RUB", "RUR", "₽"):
+        return False
+    return row.balance_cached > TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB
 
 
 def account_eligible_for_brute(row: AccountRow, cfg: Config) -> bool:

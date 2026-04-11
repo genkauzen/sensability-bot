@@ -99,6 +99,10 @@ def _mid_request_lines(method: str, path: str, json_body: Any) -> list[str]:
         if nm:
             out.append("🖥 " + bold("Имя") + ": " + code(str(nm)))
         out.append("🛡 " + code("ddos=" + str(json_body.get("is_ddos_guard"))) + " · " + code("local_net=" + str(json_body.get("is_local_network"))))
+    elif isinstance(json_body, dict) and method == "POST" and p.rstrip("/").endswith("/floating-ips"):
+        z = json_body.get("availability_zone")
+        out.append("📡 " + bold("Плавающий IPv4") + " · " + code("zone=" + str(z or "—")))
+        out.append("🛡 " + code("ddos=" + str(json_body.get("is_ddos_guard"))))
     elif isinstance(json_body, dict) and json_body and method != "GET":
         out.append("📦 " + bold("Тело") + ": " + code(_truncate(json.dumps(json_body, ensure_ascii=False), 400)))
     elif "finances" in p:

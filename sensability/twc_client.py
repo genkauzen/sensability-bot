@@ -142,6 +142,33 @@ class TimewebClient:
     async def delete_server(self, api_key: str, server_id: int) -> None:
         await self._request("DELETE", f"/api/v1/servers/{server_id}", api_key)
 
+    async def create_floating_ip(self, api_key: str, body: dict[str, Any]) -> dict[str, Any]:
+        data = await self._request("POST", "/api/v1/floating-ips", api_key, json_body=body)
+        assert isinstance(data, dict)
+        return data
+
+    async def get_floating_ip(self, api_key: str, floating_ip_id: str) -> dict[str, Any]:
+        data = await self._request("GET", f"/api/v1/floating-ips/{floating_ip_id}", api_key)
+        assert isinstance(data, dict)
+        return data
+
+    async def delete_floating_ip(self, api_key: str, floating_ip_id: str) -> None:
+        await self._request("DELETE", f"/api/v1/floating-ips/{floating_ip_id}", api_key)
+
+
+def floating_ip_record_from_response(data: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    fi = data.get("ip") or data.get("floating_ip")
+    return fi if isinstance(fi, dict) else None
+
+
+def extract_ipv4_from_floating_record(fi: dict[str, Any]) -> str | None:
+    addr = fi.get("ip")
+    if isinstance(addr, str) and addr.count(".") == 3:
+        return addr.strip()
+    return None
+
 
 def extract_public_ipv4s(ips_payload: dict[str, Any]) -> list[str]:
     out: list[str] = []
@@ -198,6 +225,16 @@ def parse_error_message(exc: TimewebApiError) -> str:
     if isinstance(msg, str):
         return msg
     return exc.body
+
+
+def is_floating_ip_not_found(exc: Exception) -> bool:
+    if isinstance(exc, TimewebApiError):
+        if exc.status == 404:
+            return True
+        msg = parse_error_message(exc).lower()
+        if "floating" in msg and "not found" in msg:
+            return True
+    return False
 
 
 def is_server_not_found(exc: Exception) -> bool:
