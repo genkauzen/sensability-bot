@@ -67,7 +67,7 @@ class BruteOrchestrator:
 
     def _build_create_body(self, vm_name: str) -> dict:
         zone = self.cfg.twc_vm_region.strip()
-        return {
+        body: dict = {
             "name": vm_name,
             "preset_id": TWC_PRESET_ID,
             "os_id": TWC_OS_ID,
@@ -75,8 +75,12 @@ class BruteOrchestrator:
             "is_ddos_guard": False,
             "is_local_network": False,
             "comment": "sensability",
-            "availability_zone": zone,
         }
+        # Конкретная availability_zone (spb-3, msk-1, …) API принимает не у всех аккаунтов
+        # (нужен мультизональный доступ); иначе 400 location_zone … is not valid.
+        if zone:
+            body["availability_zone"] = zone
+        return body
 
     async def run_once_account(self, name: str) -> None:
         if self._brute_paused:

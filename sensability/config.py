@@ -116,7 +116,7 @@ def load_config() -> Config:
         twc_proxy_use=_bool(os.getenv("TWC_PROXY_USE"), False),
         twc_proxy_url=(os.getenv("TWC_PROXY_URL") or "").strip() or None,
         twc_vm_name=(os.getenv("TWC_VM_NAME") or "sensability-vm").strip(),
-        twc_vm_region=(os.getenv("TWC_VM_REGION") or "spb-3").strip(),
+        twc_vm_region=(os.getenv("TWC_VM_REGION") or "").strip(),
         twc_atmoment_acc=max(1, _int(os.getenv("TWC_ATMOMENT_ACC"), 3)),
         twc_minimum_rubles=_float(os.getenv("TWC_MINIMUM_RUBLES"), 0.0),
         twc_vm_alivetime_minutes=max(1, _int(os.getenv("TWC_VM_ALIVETIME"), 5)),
