@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import aiosqlite
+
+from sensability.config import Config
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS accounts (
+    name TEXT PRIMARY KEY,
+    api_key TEXT NOT NULL,
+    acc_login TEXT,
+    acc_email TEXT,
+    brute_enabled INTEGER NOT NULL DEFAULT 1,
+    limited_by_balance INTEGER NOT NULL DEFAULT 0,
+    limited_by_month INTEGER NOT NULL DEFAULT 0,
+    limited_by_month_ts REAL,
+    limited_by_day INTEGER NOT NULL DEFAULT 0,
+    limited_by_day_ts REAL,
+    balance_cached REAL,
+    currency TEXT,
+    last_sync_ts REAL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,
+    account TEXT,
+    detail TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+"""
+
+
+@dataclass
+class AccountRow:
+    name: str
+    api_key: str
+    acc_login: str | None
+    acc_email: str | None
+    brute_enabled: bool
+    limited_by_balance: bool
+    limited_by_month: bool
+    limited_by_month_ts: float | None
+    limited_by_day: bool
+    limited_by_day_ts: float | None
+    balance_cached: float | None
+    currency: str | None
+    last_sync_ts: float | None
+
+
+def _row_to_account(r: aiosqlite.Row) -> AccountRow:
+    return AccountRow(
+        name=r["name"],
+        api_key=r["api_key"],
+        acc_login=r["acc_login"],
+        acc_email=r["acc_email"],
+        brute_enabled=bool(r["brute_enabled"]),
+        limited_by_balance=bool(r["limited_by_balance"]),
+        limited_by_month=bool(r["limited_by_month"]),
+        limited_by_month_ts=r["limited_by_month_ts"],
+        limited_by_day=bool(r["limited_by_day"]),
+        limited_by_day_ts=r["limited_by_day_ts"],
+        balance_cached=r["balance_cached"],
+        currency=r["currency"],
+        last_sync_ts=r["last_sync_ts"],
+    )
+
+
+class Database:
+    def __init__(self, path: str) -> None:
+        self._path = path
+
+    async def connect(self) -> None:
+        self._db = await aiosqlite.connect(self._path)
+        self._db.row_factory = aiosqlite.Row
+        await self._db.executescript(SCHEMA)
+        await self._db.commit()
+
+    async def close(self) -> None:
+        await self._db.close()
+
+    async def add_account(self, name: str, api_key: str) -> None:
+        now = time.time()
+        await self._db.execute(
+            """
+            INSERT INTO accounts (name, api_key, brute_enabled, last_sync_ts)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                api_key=excluded.api_key,
+                brute_enabled=1,
+                last_sync_ts=excluded.last_sync_ts
+            """,
+            (name, api_key, now),
+        )
+        await self._db.commit()
+
+    async def delete_account(self, name: str) -> bool:
+        cur = await self._db.execute("DELETE FROM accounts WHERE name=?", (name,))
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def set_brute_enabled(self, name: str, enabled: bool) -> bool:
+        cur = await self._db.execute(
+            "UPDATE accounts SET brute_enabled=? WHERE name=?",
+            (1 if enabled else 0, name),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def get_account(self, name: str) -> AccountRow | None:
+        cur = await self._db.execute("SELECT * FROM accounts WHERE name=?", (name,))
+        r = await cur.fetchone()
+        return _row_to_account(r) if r else None
+
+    async def list_accounts(self) -> list[AccountRow]:
+        cur = await self._db.execute("SELECT * FROM accounts ORDER BY name")
+        rows = await cur.fetchall()
+        return [_row_to_account(r) for r in rows]
+
+    async def list_brute_accounts(self) -> list[AccountRow]:
+        cur = await self._db.execute(
+            "SELECT * FROM accounts WHERE brute_enabled=1 ORDER BY name"
+        )
+        rows = await cur.fetchall()
+        return [_row_to_account(r) for r in rows]
+
+    async def patch_account(self, name: str, fields: dict[str, Any]) -> None:
+        allowed = frozenset(
+            {
+                "acc_login",
+                "acc_email",
+                "balance_cached",
+                "currency",
+                "limited_by_balance",
+                "limited_by_month",
+                "limited_by_month_ts",
+                "limited_by_day",
+                "limited_by_day_ts",
+                "brute_enabled",
+            }
+        )
+        fields = {k: v for k, v in fields.items() if k in allowed}
+        if not fields:
+            return
+        cols: list[str] = []
+        vals: list[Any] = []
+        for key, val in fields.items():
+            cols.append(f"{key}=?")
+            vals.append(val)
+        cols.append("last_sync_ts=?")
+        vals.append(time.time())
+        vals.append(name)
+        q = f"UPDATE accounts SET {', '.join(cols)} WHERE name=?"
+        await self._db.execute(q, vals)
+        await self._db.commit()
+
+    async def heal_account(self, name: str) -> bool:
+        cur = await self._db.execute(
+            """
+            UPDATE accounts SET
+                limited_by_balance=0,
+                limited_by_month=0,
+                limited_by_month_ts=NULL,
+                limited_by_day=0,
+                limited_by_day_ts=NULL
+            WHERE name=?
+            """,
+            (name,),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def log_event(self, kind: str, account: str | None, detail: Any) -> None:
+        payload = json.dumps(detail, ensure_ascii=False) if not isinstance(detail, str) else detail
+        await self._db.execute(
+            "INSERT INTO events (ts, kind, account, detail) VALUES (?,?,?,?)",
+            (time.time(), kind, account, payload),
+        )
+        await self._db.commit()
+
+    async def events_since(self, ts: float) -> list[tuple[float, str, str | None, str]]:
+        cur = await self._db.execute(
+            "SELECT ts, kind, account, detail FROM events WHERE ts >= ? ORDER BY id",
+            (ts,),
+        )
+        rows = await cur.fetchall()
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+
+def db_path(cfg: Config) -> str:
+    return str(cfg.data_dir / "sensability.db")

@@ -1,0 +1,12 @@
+services:
+  sensability:
+    build: .
+    container_name: sensability
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - .:/compose
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /app

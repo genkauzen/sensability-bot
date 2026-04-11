@@ -1,0 +1,6 @@
+# Sensability — Timeweb Cloud + Telegram
+python-telegram-bot[job-queue]==21.10
+httpx[socks]==0.28.1
+python-dotenv==1.0.1
+aiosqlite==0.20.0
+APScheduler==3.10.4
