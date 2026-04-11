@@ -30,7 +30,11 @@ CREATE TABLE IF NOT EXISTS accounts (
     whitelist_floats TEXT,
     provider TEXT NOT NULL DEFAULT 'timeweb',
     slctl_rate_until REAL,
-    whitelist_slctl TEXT
+    whitelist_slctl TEXT,
+    slctl_keystone_user TEXT,
+    slctl_keystone_domain TEXT,
+    slctl_keystone_password TEXT,
+    slctl_token_issued_ts REAL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -66,6 +70,10 @@ class AccountRow:
     provider: str
     slctl_rate_until: float | None
     whitelist_slctl: str | None
+    slctl_keystone_user: str | None
+    slctl_keystone_domain: str | None
+    slctl_keystone_password: str | None
+    slctl_token_issued_ts: float | None
 
 
 def _row_to_account(r: aiosqlite.Row) -> AccountRow:
@@ -89,6 +97,10 @@ def _row_to_account(r: aiosqlite.Row) -> AccountRow:
         provider=str(_col(r, "provider") or "timeweb"),
         slctl_rate_until=_col(r, "slctl_rate_until"),
         whitelist_slctl=_col(r, "whitelist_slctl"),
+        slctl_keystone_user=_col(r, "slctl_keystone_user"),
+        slctl_keystone_domain=_col(r, "slctl_keystone_domain"),
+        slctl_keystone_password=_col(r, "slctl_keystone_password"),
+        slctl_token_issued_ts=_col(r, "slctl_token_issued_ts"),
     )
 
 
@@ -121,6 +133,10 @@ class Database:
             ("provider", "TEXT"),
             ("slctl_rate_until", "REAL"),
             ("whitelist_slctl", "TEXT"),
+            ("slctl_keystone_user", "TEXT"),
+            ("slctl_keystone_domain", "TEXT"),
+            ("slctl_keystone_password", "TEXT"),
+            ("slctl_token_issued_ts", "REAL"),
         ):
             if col not in have:
                 default = ""
@@ -134,19 +150,46 @@ class Database:
     async def close(self) -> None:
         await self._db.close()
 
-    async def add_account(self, name: str, api_key: str, provider: str = "timeweb") -> None:
+    async def add_account(
+        self,
+        name: str,
+        api_key: str,
+        provider: str = "timeweb",
+        *,
+        slctl_keystone_user: str | None = None,
+        slctl_keystone_domain: str | None = None,
+        slctl_keystone_password: str | None = None,
+        slctl_token_issued_ts: float | None = None,
+    ) -> None:
         now = time.time()
         await self._db.execute(
             """
-            INSERT INTO accounts (name, api_key, brute_enabled, last_sync_ts, provider)
-            VALUES (?, ?, 1, ?, ?)
+            INSERT INTO accounts (
+                name, api_key, brute_enabled, last_sync_ts, provider,
+                slctl_keystone_user, slctl_keystone_domain, slctl_keystone_password,
+                slctl_token_issued_ts
+            )
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 api_key=excluded.api_key,
                 brute_enabled=1,
                 last_sync_ts=excluded.last_sync_ts,
-                provider=excluded.provider
+                provider=excluded.provider,
+                slctl_keystone_user=excluded.slctl_keystone_user,
+                slctl_keystone_domain=excluded.slctl_keystone_domain,
+                slctl_keystone_password=excluded.slctl_keystone_password,
+                slctl_token_issued_ts=excluded.slctl_token_issued_ts
             """,
-            (name, api_key, now, provider),
+            (
+                name,
+                api_key,
+                now,
+                provider,
+                slctl_keystone_user,
+                slctl_keystone_domain,
+                slctl_keystone_password,
+                slctl_token_issued_ts,
+            ),
         )
         await self._db.commit()
 
@@ -198,6 +241,11 @@ class Database:
                 "whitelist_floats",
                 "slctl_rate_until",
                 "whitelist_slctl",
+                "api_key",
+                "slctl_keystone_user",
+                "slctl_keystone_domain",
+                "slctl_keystone_password",
+                "slctl_token_issued_ts",
             }
         )
         fields = {k: v for k, v in fields.items() if k in allowed}

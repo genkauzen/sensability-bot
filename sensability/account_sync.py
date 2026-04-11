@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.jwt_util import jwt_payload_unverified
+from sensability.slctl_constants import SLCTL_TOKEN_REFRESH_MAX_AGE_SEC
 from sensability.slctl_client import SelectelClient
 from sensability.twc_constants import (
     TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB,
@@ -85,11 +86,47 @@ async def _sync_timeweb(
     return await db.get_account(name)
 
 
+async def _ensure_selectel_iam_token(
+    db: Database, slctl: SelectelClient, name: str, row: AccountRow
+) -> AccountRow:
+    """Если в БД есть логин/домен/пароль — при необходимости выдаём новый X-Subject-Token."""
+    use_pw = (
+        row.slctl_keystone_user
+        and row.slctl_keystone_domain
+        and row.slctl_keystone_password
+    )
+    if not use_pw:
+        return row
+    now = time.time()
+    stale = (
+        row.slctl_token_issued_ts is None
+        or (now - row.slctl_token_issued_ts) > SLCTL_TOKEN_REFRESH_MAX_AGE_SEC
+    )
+    if not stale:
+        return row
+    tok = await slctl.issue_iam_token_by_password(
+        row.slctl_keystone_user,
+        row.slctl_keystone_domain,
+        row.slctl_keystone_password,
+    )
+    await db.patch_account(
+        name,
+        {
+            "api_key": tok,
+            "slctl_token_issued_ts": now,
+            "acc_login": row.slctl_keystone_user,
+        },
+    )
+    out = await db.get_account(name)
+    return out if out else row
+
+
 async def _sync_selectel(
     db: Database, slctl: SelectelClient, cfg: Config, name: str, row: AccountRow
 ) -> AccountRow | None:
     now = time.time()
     patch = _expire_limits(row, now)
+    row = await _ensure_selectel_iam_token(db, slctl, name, row)
     bal, cur = await slctl.get_balance_rub(row.api_key)
     limited_by_balance = False
     if bal is not None and bal < cfg.slctl_minimum_rubles:

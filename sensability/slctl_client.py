@@ -135,6 +135,46 @@ class SelectelClient:
             return parsed
         return body
 
+    async def issue_iam_token_by_password(
+        self,
+        username: str,
+        account_domain: str,
+        password: str,
+    ) -> str:
+        """Keystone password grant → заголовок X-Subject-Token (IAM для аккаунта)."""
+        url = f"{IDENTITY_URL_DEFAULT}/auth/tokens"
+        body: dict[str, Any] = {
+            "auth": {
+                "identity": {
+                    "methods": ["password"],
+                    "password": {
+                        "user": {
+                            "name": username.strip(),
+                            "domain": {"name": str(account_domain).strip()},
+                            "password": password,
+                        }
+                    },
+                },
+                "scope": {"domain": {"name": str(account_domain).strip()}},
+            }
+        }
+        r = await self._client.post(
+            url,
+            json=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        token = r.headers.get("X-Subject-Token") or r.headers.get("x-subject-token")
+        parsed: dict | None = None
+        if r.text.strip():
+            try:
+                parsed = json.loads(r.text)
+            except json.JSONDecodeError:
+                parsed = None
+        if r.status_code not in (200, 201) or not token:
+            raise SlctlApiError(r.status_code, r.text[:1500], parsed)
+        self._endpoint_cache.clear()
+        return str(token).strip()
+
     async def validate_token(self, token: str) -> dict[str, Any]:
         """Проверка IAM-токена и получение каталога."""
         url = f"{IDENTITY_URL_DEFAULT}/auth/tokens"

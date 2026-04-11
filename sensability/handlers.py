@@ -183,6 +183,36 @@ def _split_name_key(arg: str) -> tuple[str | None, str | None]:
     return name, key
 
 
+def _parse_selectel_account_add(rest: str) -> dict[str, Any] | None:
+    """
+    Режим password (Keystone): два фрагмента через пробел:
+    «имя_в_боте:логин_сервисного_пользователя» «номер_аккаунта:пароль»
+    Пример: v1880:myuser 573082:SecretPass@here
+
+    Режим готового токена: «имя:IAM_токен» (один фрагмент, как раньше).
+    """
+    rest = rest.strip()
+    parts = rest.split(None, 1)
+    if len(parts) == 2:
+        left, right = parts[0].strip(), parts[1].strip()
+        if ":" in left and ":" in right:
+            na, ku = left.split(":", 1)
+            dom, pw = right.split(":", 1)
+            na, ku, dom, pw = na.strip(), ku.strip(), dom.strip(), pw.strip()
+            if na and ku and dom and pw:
+                return {
+                    "mode": "password",
+                    "name": na,
+                    "keystone_user": ku,
+                    "account_domain": dom,
+                    "password": pw,
+                }
+    name, tok = _split_name_key(rest)
+    if name and tok:
+        return {"mode": "token", "name": name, "iam_token": tok}
+    return None
+
+
 async def handle_account_terminal_commands(
     cfg: Config,
     db: Database,
@@ -609,41 +639,87 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
     if m:
         prov_raw = (m.group(1) or "").strip().lower()
         rest = (m.group(2) or "").strip()
-        name, key = _split_name_key(rest)
-        if not name or not key:
-            await notify.accountverify_reply(
-                tid,
-                "Формат: "
-                + code("/account_add timeweb имя:apiKey")
-                + " или "
-                + code("/account_add selectel имя:IAM-токен"),
-            )
-            return
         if prov_raw in ("selectel", "slctl"):
             prov = "selectel"
         else:
             prov = "timeweb"
         bal: float | None = None
         cur: str | None = None
-        if prov == "selectel":
-            try:
-                await slctl.validate_token(key)
-                bal, cur = await slctl.get_balance_rub(key)
-            except Exception as ex:
+        if prov == "timeweb":
+            name, key = _split_name_key(rest)
+            if not name or not key:
                 await notify.accountverify_reply(
                     tid,
-                    "❌ Selectel IAM-токен не подошёл (нужен X-Auth-Token сервисного пользователя): "
-                    + esc(str(ex)[:500]),
+                    "Формат: " + code("/account_add timeweb имя:apiKey"),
                 )
                 return
-        else:
             try:
                 fin = await twc.get_finances(key)
                 bal, cur = finances_balance_rubles(fin)
             except Exception as ex:
                 await notify.accountverify_reply(tid, f"❌ API ключ не подошёл: {esc(str(ex)[:400])}")
                 return
-        await db.add_account(name, key, provider=prov)
+            await db.add_account(name, key, provider=prov)
+        else:
+            parsed = _parse_selectel_account_add(rest)
+            if not parsed:
+                await notify.accountverify_reply(
+                    tid,
+                    "\n".join(
+                        [
+                            "Формат Selectel:",
+                            "• "
+                            + bold("Логин/пароль (авто IAM)")
+                            + " — "
+                            + code("/account_add selectel имя_бота:логин_сервиса номер_аккаунта:пароль"),
+                            "  пример: "
+                            + code("v1880:service_user 573082:MyPass@word"),
+                            "• "
+                            + bold("Готовый IAM-токен")
+                            + " — "
+                            + code("/account_add selectel имя:токен"),
+                        ]
+                    ),
+                )
+                return
+            if parsed["mode"] == "password":
+                name = str(parsed["name"])
+                ku = str(parsed["keystone_user"])
+                dom = str(parsed["account_domain"])
+                pw = str(parsed["password"])
+                try:
+                    key = await slctl.issue_iam_token_by_password(ku, dom, pw)
+                    await slctl.validate_token(key)
+                    bal, cur = await slctl.get_balance_rub(key)
+                except Exception as ex:
+                    await notify.accountverify_reply(
+                        tid,
+                        "❌ Selectel Keystone (логин/домен/пароль): " + esc(str(ex)[:600]),
+                    )
+                    return
+                await db.add_account(
+                    name,
+                    key,
+                    provider="selectel",
+                    slctl_keystone_user=ku,
+                    slctl_keystone_domain=dom,
+                    slctl_keystone_password=pw,
+                    slctl_token_issued_ts=time.time(),
+                )
+                await db.patch_account(name, {"acc_login": ku})
+            else:
+                name = str(parsed["name"])
+                key = str(parsed["iam_token"])
+                try:
+                    await slctl.validate_token(key)
+                    bal, cur = await slctl.get_balance_rub(key)
+                except Exception as ex:
+                    await notify.accountverify_reply(
+                        tid,
+                        "❌ Selectel IAM-токен: " + esc(str(ex)[:500]),
+                    )
+                    return
+                await db.add_account(name, key, provider="selectel")
         row = await sync_account(db, twc, slctl, cfg, name)
         em = row.acc_email if row else None
         lg = row.acc_login if row else None
@@ -764,8 +840,9 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         "\n".join(
             [
                 bold("Команды аккаунтов"),
-                code("/account_add timeweb имя:apiKey")
-                + " · "
+                code("/account_add timeweb имя:apiKey"),
+                code("/account_add selectel бот:логин номер_аккаунта:пароль")
+                + " или "
                 + code("/account_add selectel имя:IAM-токен"),
                 code("/account_info имя"),
                 code("/account_list"),
