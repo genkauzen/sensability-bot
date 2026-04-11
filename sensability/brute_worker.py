@@ -13,10 +13,18 @@ from sensability.ip_pool import ipv4_in_pool
 from sensability.notify import TelegramNotify
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, code, esc, spoiler_code
+from sensability.twc_constants import (
+    TWC_BANDWIDTH,
+    TWC_OS_ID,
+    TWC_PRESET_ID,
+    create_server_network_for_public_ipv4,
+    location_for_availability_zone,
+)
 from sensability.twc_client import (
     TimewebApiError,
     extract_ipv4_from_server,
     extract_public_ipv4s,
+    is_server_not_found,
     looks_like_month_balance_error,
     parse_error_message,
 )
@@ -28,6 +36,7 @@ log = logging.getLogger("sensability.brute")
 
 POLL_INTERVAL = 3.0
 POLL_ATTEMPTS = 45
+NOTFOUND_GIVEUP = 3
 
 
 class BruteOrchestrator:
@@ -50,9 +59,38 @@ class BruteOrchestrator:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
+        self._brute_paused = False
+
+    def set_brute_paused(self, paused: bool) -> None:
+        self._brute_paused = paused
+
+    def is_brute_paused(self) -> bool:
+        return self._brute_paused
+
+    def _build_create_body(self, vm_name: str) -> dict:
+        zone = self.cfg.twc_vm_region.strip()
+        loc = location_for_availability_zone(zone)
+        body: dict = {
+            "name": vm_name,
+            "preset_id": TWC_PRESET_ID,
+            "os_id": TWC_OS_ID,
+            "bandwidth": TWC_BANDWIDTH,
+            "is_ddos_guard": False,
+            "is_local_network": False,
+            "comment": "sensability",
+            "availability_zone": zone,
+            "network": create_server_network_for_public_ipv4(),
+        }
+        if loc:
+            body["location"] = loc
+        return body
 
     async def run_once_account(self, name: str) -> None:
+        if self._brute_paused:
+            return
         async with self._sem:
+            if self._brute_paused:
+                return
             row = await sync_account(self.db, self.twc, self.cfg, name)
             if not row:
                 return
@@ -61,16 +99,7 @@ class BruteOrchestrator:
 
             await self.stats.track_account(name)
             vm_name = f"{self.cfg.twc_vm_name}-{row.name}-{uuid.uuid4().hex[:8]}"
-            body = {
-                "name": vm_name,
-                "preset_id": self.cfg.twc_preset_id,
-                "os_id": self.cfg.twc_os_id,
-                "bandwidth": self.cfg.twc_bandwidth,
-                "is_ddos_guard": False,
-                "is_local_network": False,
-                "comment": "sensability",
-                "availability_zone": self.cfg.twc_vm_region,
-            }
+            body = self._build_create_body(vm_name)
 
             if self.cfg.full_logs:
                 await self.notify.logs(f"{bold('TWC')} <code>POST /api/v1/servers</code> · {esc(name)}")
@@ -110,8 +139,9 @@ class BruteOrchestrator:
             region = str(server.get("availability_zone") or self.cfg.twc_vm_region)
 
             pub_ip: str | None = None
+            notfound_streak = 0
             for _ in range(POLL_ATTEMPTS):
-                if self._stop.is_set():
+                if self._stop.is_set() or self._brute_paused:
                     break
                 await asyncio.sleep(POLL_INTERVAL)
                 await self.stats.add_ipv4_check()
@@ -127,6 +157,37 @@ class BruteOrchestrator:
                         if ip.count(".") == 3:
                             pub_ip = ip
                             break
+                except TimewebApiError as ex:
+                    if is_server_not_found(ex):
+                        notfound_streak += 1
+                        if self.cfg.full_logs:
+                            await self.notify.logs(
+                                f"{bold('poll ip')} {esc(name)}: сервер не найден ({notfound_streak}/{NOTFOUND_GIVEUP})"
+                            )
+                        if notfound_streak >= NOTFOUND_GIVEUP:
+                            await self.notify.live(
+                                "\n".join(
+                                    [
+                                        f"🖥 {bold('Live')}",
+                                        f"Аккаунт: {code(name)}",
+                                        f"ВМ: {code(vm_name)}",
+                                        f"Регион: {code(region)}",
+                                        f"IPv4: {code('— (ВМ удалена вручную, снято с учёта)')}",
+                                    ]
+                                )
+                            )
+                            await self.notify.logs(
+                                f"⚠️ {bold('ВМ снята с учёта')} {code(name)} id {code(str(server_id))} — "
+                                f"нет в API после ручного удаления."
+                            )
+                            await self.db.log_event(
+                                "vm_registry_drop",
+                                name,
+                                {"server_id": server_id, "reason": "404 x3"},
+                            )
+                            return
+                    elif self.cfg.full_logs:
+                        await self.notify.logs(f"{bold('poll ip')} {esc(name)}: {esc(str(ex)[:200])}")
                 except Exception as ex:
                     if self.cfg.full_logs:
                         await self.notify.logs(f"{bold('poll ip')} {esc(name)}: {esc(str(ex)[:200])}")
@@ -146,6 +207,8 @@ class BruteOrchestrator:
             )
 
             if not pub_ip:
+                if notfound_streak >= NOTFOUND_GIVEUP:
+                    return
                 await self.db.patch_account(
                     name,
                     {
@@ -156,6 +219,9 @@ class BruteOrchestrator:
                 await self.stats.add_cooldown24()
                 try:
                     await self.twc.delete_server(row.api_key, server_id)
+                except TimewebApiError as ex:
+                    if not is_server_not_found(ex):
+                        await self.notify.logs(f"{bold('Удаление ВМ')} {esc(str(ex)[:300])}")
                 except Exception as ex:
                     await self.notify.logs(f"{bold('Удаление ВМ')} {esc(str(ex)[:300])}")
                 await self.db.log_event("no_ipv4", name, {"server_id": server_id})
@@ -184,6 +250,9 @@ class BruteOrchestrator:
                 await self.stats.add_vm_deleted_no_pool()
                 try:
                     await self.twc.delete_server(row.api_key, server_id)
+                except TimewebApiError as ex:
+                    if not is_server_not_found(ex):
+                        await self.notify.logs(f"{bold('Удаление ВМ')} {esc(str(ex)[:300])}")
                 except Exception as ex:
                     await self.notify.logs(f"{bold('Удаление ВМ')} {esc(str(ex)[:300])}")
                 await self.db.log_event("ip_not_in_pool", name, {"ip": pub_ip, "server_id": server_id})
@@ -204,11 +273,17 @@ class BruteOrchestrator:
                 )
             )
             await self.db.log_event("vm_shutdown_timer", acc_name, {"server_id": server_id})
+        except TimewebApiError as ex:
+            if is_server_not_found(ex):
+                return
+            await self.notify.logs(f"{bold('Ошибка выключения ВМ')}: {esc(str(ex)[:400])}")
         except Exception as ex:
             await self.notify.logs(f"{bold('Ошибка выключения ВМ')}: {esc(str(ex)[:400])}")
 
     async def _account_loop(self, name: str) -> None:
         while not self._stop.is_set():
+            while self._brute_paused and not self._stop.is_set():
+                await asyncio.sleep(1.0)
             try:
                 await self.run_once_account(name)
             except asyncio.CancelledError:

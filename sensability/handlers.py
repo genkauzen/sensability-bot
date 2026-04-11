@@ -99,7 +99,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    cfg, db, twc, stats, notify, _orch = _ctx(context.application)
+    cfg, db, twc, stats, notify, orch = _ctx(context.application)
     tid = update.message.message_thread_id if update.message else None
     low = text.lower().strip()
 
@@ -109,9 +109,11 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 bold("Sensability — терминал"),
                 "/status — состояние бота",
                 "/modules — активные компоненты",
-                "/drop — docker compose down (пауза)",
-                "/restart — down + up",
-                "/rebuild — down + build --no-cache + up",
+                "/stop — приостановить перебор IP",
+                "/continue — продолжить перебор",
+                "/drop — docker compose down",
+                "/restart — пересоздать контейнеры (force-recreate)",
+                "/rebuild — build --no-cache + up force-recreate",
                 "/help — этот список",
             ]
         )
@@ -147,9 +149,20 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 f"Проверок IPv4 (сессия): {code(str(snap.ipv4_checks))}",
                 f"Попаданий в ПНА (сессия): {code(str(snap.pool_hits))}",
                 f"Параллельных аккаунтов: {code(str(cfg.twc_atmoment_acc))}",
+                f"Перебор: {code('на паузе' if orch.is_brute_paused() else 'активен')}",
             ]
         )
         await notify.terminal_reply(tid, body)
+        return
+
+    if low == "/stop":
+        orch.set_brute_paused(True)
+        await notify.terminal_reply(tid, "⏸ " + bold("Перебор приостановлен") + "\nПродолжить: " + code("/continue"))
+        return
+
+    if low == "/continue":
+        orch.set_brute_paused(False)
+        await notify.terminal_reply(tid, "▶️ " + bold("Перебор возобновлён"))
         return
 
     if low == "/drop":
@@ -170,37 +183,55 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         return
 
     if low == "/restart":
-        await notify.terminal_reply(tid, "⏳ " + bold("Перезапуск стека") + " — down && up -d…")
+        await notify.terminal_reply(
+            tid,
+            "⏳ "
+            + bold("Перезапуск стека")
+            + " — <code>compose up -d --force-recreate</code> (без down из контейнера, иначе конфликт имён)…",
+        )
 
         async def job() -> None:
             await asyncio.sleep(2.0)
             if not compose_dir_ok(cfg):
                 await notify.terminal_reply(tid, "❌ compose dir missing")
                 return
-            c1, o1, e1 = await compose_command(cfg, "down")
-            c2, o2, e2 = await compose_command(cfg, "up", "-d")
-            txt = (o1 + e1 + o2 + e2)[:3500]
-            await notify.terminal_reply(tid, f"restart: {c1}/{c2}\n<pre>{esc(txt)}</pre>")
+            c, o, e = await compose_command(
+                cfg, "up", "-d", "--force-recreate", "--remove-orphans"
+            )
+            txt = (o + e)[:3500]
+            await notify.terminal_reply(
+                tid,
+                f"{'✅' if c == 0 else '⚠️'} restart exit {c}\n<pre>{esc(txt)}</pre>",
+            )
 
         asyncio.create_task(job())
         return
 
     if low == "/rebuild":
-        await notify.terminal_reply(tid, "⏳ " + bold("Полная пересборка") + " — может занять несколько минут…")
+        await notify.terminal_reply(tid, "⏳ " + bold("Полная пересборка") + " — build + force-recreate…")
 
         async def job() -> None:
             await asyncio.sleep(2.0)
             if not compose_dir_ok(cfg):
                 await notify.terminal_reply(tid, "❌ compose dir missing")
                 return
-            for args in (("down",), ("build", "--no-cache"), ("up", "-d")):
-                c, o, e = await compose_command(cfg, *args)
-                if c != 0:
-                    await notify.terminal_reply(
-                        tid,
-                        f"⚠️ step failed {args}: {c}\n<pre>{esc((o + e)[:3500])}</pre>",
-                    )
-                    return
+            c1, o1, e1 = await compose_command(cfg, "build", "--no-cache")
+            if c1 != 0:
+                await notify.terminal_reply(
+                    tid,
+                    f"⚠️ build failed: {c1}\n<pre>{esc((o1 + e1)[:3500])}</pre>",
+                )
+                return
+            c2, o2, e2 = await compose_command(
+                cfg, "up", "-d", "--force-recreate", "--no-build", "--remove-orphans"
+            )
+            txt = (o2 + e2)[:3500]
+            if c2 != 0:
+                await notify.terminal_reply(
+                    tid,
+                    f"⚠️ up failed: {c2}\n<pre>{esc(txt)}</pre>",
+                )
+                return
             await notify.terminal_reply(tid, "✅ " + bold("Пересборка завершена"))
 
         asyncio.create_task(job())

@@ -164,6 +164,19 @@ def parse_error_message(exc: TimewebApiError) -> str:
     return exc.body
 
 
+def is_server_not_found(exc: Exception) -> bool:
+    if isinstance(exc, TimewebApiError):
+        if exc.status == 404:
+            return True
+        ec = (exc.parsed or {}).get("error_code")
+        if ec == "server_not_found":
+            return True
+        msg = parse_error_message(exc).lower()
+        if "server_not_found" in msg or "server with id" in msg:
+            return True
+    return False
+
+
 def deep_find_email(obj: Any) -> str | None:
     if isinstance(obj, dict):
         for k, v in obj.items():

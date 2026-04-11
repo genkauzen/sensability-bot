@@ -59,9 +59,6 @@ class Config:
     twc_proxy_url: str | None
     twc_vm_name: str
     twc_vm_region: str
-    twc_preset_id: int
-    twc_os_id: int
-    twc_bandwidth: int
     twc_atmoment_acc: int
     twc_minimum_rubles: float
     twc_vm_alivetime_minutes: int
@@ -71,13 +68,33 @@ class Config:
     subnets_path: Path
 
 
+def _resolve_compose_dir(package_root: Path) -> Path:
+    override = (os.getenv("SENSABILITY_COMPOSE_DIR") or "").strip()
+    if override:
+        p = Path(override)
+        if p.is_dir() and (p / "docker-compose.yml").is_file():
+            return p.resolve()
+    candidates = [
+        Path("/compose"),
+        package_root,
+        Path.cwd(),
+    ]
+    for p in candidates:
+        try:
+            if p.is_dir() and (p / "docker-compose.yml").is_file():
+                return p.resolve()
+        except OSError:
+            continue
+    return package_root
+
+
 def load_config() -> Config:
     load_dotenv()
     data_dir = Path(os.getenv("SENSABILITY_DATA_DIR", "/app/data"))
     data_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parent.parent
     subnets = Path(os.getenv("SENSABILITY_SUBNETS_PATH", str(root / "subnets.txt")))
-    compose = Path(os.getenv("SENSABILITY_COMPOSE_DIR", "/compose"))
+    compose = _resolve_compose_dir(root)
 
     return Config(
         bot_token=os.getenv("BOT_TOKEN", "").strip(),
@@ -100,9 +117,6 @@ def load_config() -> Config:
         twc_proxy_url=(os.getenv("TWC_PROXY_URL") or "").strip() or None,
         twc_vm_name=(os.getenv("TWC_VM_NAME") or "sensability-vm").strip(),
         twc_vm_region=(os.getenv("TWC_VM_REGION") or "spb-3").strip(),
-        twc_preset_id=_int(os.getenv("TWC_PRESET_ID"), 122),
-        twc_os_id=_int(os.getenv("TWC_OS_ID"), 65),
-        twc_bandwidth=_int(os.getenv("TWC_BANDWIDTH"), 200),
         twc_atmoment_acc=max(1, _int(os.getenv("TWC_ATMOMENT_ACC"), 3)),
         twc_minimum_rubles=_float(os.getenv("TWC_MINIMUM_RUBLES"), 0.0),
         twc_vm_alivetime_minutes=max(1, _int(os.getenv("TWC_VM_ALIVETIME"), 5)),
