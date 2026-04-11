@@ -13,7 +13,13 @@ from sensability.brute_worker import BruteOrchestrator
 from sensability.config import Config, load_config
 from sensability.db import Database, db_path
 from sensability.handlers import on_message, schedule_daily
-from sensability.ip_pool import load_networks, load_potential_networks
+from sensability.ip_pool import (
+    fetch_cidr_networks_from_url,
+    load_networks,
+    load_potential_networks,
+    merge_ipv4_networks,
+)
+from sensability.slctl_client import SelectelClient
 from sensability.notify import TelegramNotify
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, esc
@@ -37,10 +43,12 @@ async def post_init(application: Application) -> None:
 async def post_shutdown(application: Application) -> None:
     orch: BruteOrchestrator = application.bot_data["orchestrator"]
     twc: TimewebClient = application.bot_data["twc"]
+    slctl: SelectelClient = application.bot_data["slctl"]
     db: Database = application.bot_data["db"]
     notify: TelegramNotify = application.bot_data["notify"]
     await orch.stop()
     await twc.aclose()
+    await slctl.aclose()
     await db.close()
     try:
         await notify.logs("⏹ " + bold("Sensability остановлен"))
@@ -96,13 +104,27 @@ def main() -> None:
     twc = TimewebClient(twc_proxy, debug_ctrl=twc_debug, debug_emit=twc_debug_emit)
     nets = load_networks(str(cfg.subnets_path))
     pot = load_potential_networks(str(cfg.potential_subnets_path))
-    orchestrator = BruteOrchestrator(cfg, db, twc, stats, notify, nets, pot)
+    extra_slctl: tuple = ()
+    try:
+        extra_slctl = fetch_cidr_networks_from_url(cfg.slctl_whitelist_cidr_url)
+        log.info("Selectel extra CIDR lines: %s", len(extra_slctl))
+    except Exception as ex:
+        log.warning("Selectel whitelist CIDR URL failed (%s): %s", cfg.slctl_whitelist_cidr_url, ex)
+    nets_selectel = merge_ipv4_networks(nets, extra_slctl)
+
+    slctl_proxy = cfg.slctl_proxy_url if cfg.slctl_proxy_use and cfg.slctl_proxy_url else None
+    slctl = SelectelClient(slctl_proxy)
+
+    orchestrator = BruteOrchestrator(
+        cfg, db, twc, slctl, stats, notify, nets, pot, nets_selectel
+    )
 
     tz = os.getenv("TZ", "Europe/Moscow")
     application.bot_data.update(
         cfg=cfg,
         db=db,
         twc=twc,
+        slctl=slctl,
         twc_debug=twc_debug,
         stats=stats,
         notify=notify,

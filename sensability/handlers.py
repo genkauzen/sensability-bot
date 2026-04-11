@@ -13,6 +13,7 @@ from telegram.ext import ContextTypes
 from zoneinfo import ZoneInfo
 
 from sensability.account_sync import account_prefers_floating_ip_probe, sync_account
+from sensability.slctl_client import SelectelClient, extract_public_ipv4_from_nova_server
 from sensability.brute_worker import BruteOrchestrator
 from sensability.config import Config
 from sensability.db import AccountRow, Database
@@ -35,7 +36,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("sensability.handlers")
 
-RE_ACCOUNT_ADD = re.compile(r"^/(?:account_add_twc|account_add)\s+(.+)$", re.I)
+RE_ACCOUNT_ADD = re.compile(
+    r"^/(?:account_add_twc|account_add)\s+(?:(timeweb|twc|selectel|slctl)\s+)?(.+)$",
+    re.I,
+)
 RE_ACCOUNT_INFO = re.compile(r"^/account_info\s+(.+)$", re.I)
 RE_ACCOUNT_DEL = re.compile(r"^/account_del\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_DISABLE = re.compile(r"^/(?:account_disable|accont_disable)\s+(\S+)\s*$", re.I)
@@ -105,6 +109,34 @@ def _twc_account_resources_lines(
     return lines
 
 
+async def _slctl_account_resources_block(
+    db: Database, slctl: SelectelClient, cfg: Config, row: AccountRow
+) -> list[str]:
+    if row.provider != "selectel":
+        return []
+    reg = cfg.slctl_ip_location.strip()
+    w = set(db.whitelist_slctl_ids(row))
+    try:
+        srvs = await slctl.list_servers(row.api_key, reg)
+    except Exception as ex:
+        return ["┈ " + bold("ВМ Nova (Selectel)") + f": ❌ {esc(str(ex)[:280])}"]
+    lines: list[str] = [
+        "┈ " + bold("ВМ Nova (Selectel)") + f" ({code(str(len(srvs)))})",
+    ]
+    for s in srvs[:40]:
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get("id") or "").strip() or "—"
+        nm = str(s.get("name") or "—")
+        st = str(s.get("status") or s.get("OS-EXT-STS:vm_state") or "—")
+        ip = extract_public_ipv4_from_nova_server(s) or "—"
+        wl = " · 🔒 белый список" if sid in w else ""
+        lines.append(f"   • {code(sid)} {code(nm)} · {esc(st)} · IPv4 {code(ip)}{wl}")
+    if len(srvs) > 40:
+        lines.append("   … " + bold("ещё") + f" {code(str(len(srvs) - 40))}")
+    return lines
+
+
 async def _twc_account_resources_block(db: Database, twc: TimewebClient, row: AccountRow) -> list[str]:
     srv_pl: dict[str, Any] = {}
     fl_pl: dict[str, Any] = {}
@@ -155,6 +187,7 @@ async def handle_account_terminal_commands(
     cfg: Config,
     db: Database,
     twc: TimewebClient,
+    slctl: SelectelClient,
     text: str,
     reply: Callable[[str], Awaitable[None]],
 ) -> bool:
@@ -167,22 +200,27 @@ async def handle_account_terminal_commands(
             await reply("📭 " + bold("Аккаунты") + " — пока пусто.")
             return True
         lines = [
-            "📋 " + bold("Список аккаунтов Timeweb") + f" · {code(str(len(rows)))} шт.",
+            "📋 " + bold("Список аккаунтов") + f" · {code(str(len(rows)))} шт.",
             "",
         ]
         for r in rows[:60]:
             bal = "—" if r.balance_cached is None else f"{r.balance_cached:g}"
             cur = esc(r.currency or "")
             be = "🟢" if r.brute_enabled else "⚫"
+            prov = "SL" if r.provider == "selectel" else "TW"
             lim = []
             if r.limited_by_balance:
                 lim.append("баланс")
-            if r.limited_by_month:
-                lim.append("месяц")
-            if r.limited_by_day:
-                lim.append("сутки")
+            if r.provider == "selectel":
+                if r.slctl_rate_until and time.time() < r.slctl_rate_until:
+                    lim.append("rate")
+            else:
+                if r.limited_by_month:
+                    lim.append("месяц")
+                if r.limited_by_day:
+                    lim.append("сутки")
             lim_s = (" · ⚠️ " + ", ".join(lim)) if lim else ""
-            lines.append(f"{be} {code(r.name)} · 💰 {code(bal)} {cur}{lim_s}")
+            lines.append(f"{be} [{prov}] {code(r.name)} · 💰 {code(bal)} {cur}{lim_s}")
         if len(rows) > 60:
             lines.append("")
             lines.append("… " + bold("ещё") + f" {code(str(len(rows) - 60))} — уточните по имени.")
@@ -229,7 +267,7 @@ async def handle_account_terminal_commands(
         else:
             unknown.append(fl)
     try:
-        synced = await sync_account(db, twc, cfg, name)
+        synced = await sync_account(db, twc, slctl, cfg, name)
         row = synced if synced else await db.get_account(name)
     except Exception:
         row = await db.get_account(name)
@@ -243,16 +281,40 @@ async def handle_account_terminal_commands(
     if row.limited_by_month and row.limited_by_month_ts:
         lm = max(0, int(row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC - now))
         left_m = f"{lm // 3600}ч {(lm % 3600) // 60}м"
+    left_rate = "—"
+    if row.slctl_rate_until and now < row.slctl_rate_until:
+        lr = max(0, int(row.slctl_rate_until - now))
+        left_rate = f"{lr // 60}м {lr % 60}с"
     bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
-    mode_ip = (
-        "📡 плавающий IPv4 (без ВМ)"
-        if account_prefers_floating_ip_probe(row)
-        else "🖥 облачная ВМ"
+    if row.provider == "selectel":
+        mode_ip = "🖥 Selectel Nova (публичный IPv4)"
+    else:
+        mode_ip = (
+            "📡 плавающий IPv4 (без ВМ)"
+            if account_prefers_floating_ip_probe(row)
+            else "🖥 облачная ВМ Timeweb"
+        )
+    res_lines = (
+        await _slctl_account_resources_block(db, slctl, cfg, row)
+        if row.provider == "selectel"
+        else await _twc_account_resources_block(db, twc, row)
     )
-    res_lines = await _twc_account_resources_block(db, twc, row)
+    lim_lines: list[str] = []
+    if row.provider != "selectel":
+        lim_lines = [
+            "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
+            "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
+        ]
+    else:
+        lim_lines = [
+            "┈ "
+            + bold("Пауза API (429/503)")
+            + f": {'⚠️ да' if (row.slctl_rate_until and now < row.slctl_rate_until) else '✅ нет'} (~{left_rate})",
+        ]
     panel = "\n".join(
         [
             "🪪 " + bold("Управление аккаунтом") + f" {code(name)}",
+            "┈ " + bold("Провайдер") + f": {code('Selectel' if row.provider == 'selectel' else 'Timeweb')}",
             "┈ " + bold("Email") + f": {code(row.acc_email or '—')}",
             "┈ " + bold("ФИО (личные данные)") + f": {code(row.acc_full_name or '—')}",
             "┈ " + bold("Login") + f": {code(row.acc_login or '—')}",
@@ -260,8 +322,7 @@ async def handle_account_terminal_commands(
             "┈ " + bold("Режим перебора") + f": {mode_ip}",
             "┈ " + bold("В подборе") + f": {'✅ да' if row.brute_enabled else '❌ нет'}",
             "┈ " + bold("Лимит баланса") + f": {'⚠️ да' if row.limited_by_balance else '✅ нет'}",
-            "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
-            "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
+            *lim_lines,
             "",
             *res_lines,
             "",
@@ -288,12 +349,15 @@ async def handle_account_terminal_commands(
     return True
 
 
-def _ctx(application: Any) -> tuple[Config, Database, TimewebClient, StatsCollector, TelegramNotify, BruteOrchestrator]:
+def _ctx(
+    application: Any,
+) -> tuple[Config, Database, TimewebClient, SelectelClient, StatsCollector, TelegramNotify, BruteOrchestrator]:
     ctx = application.bot_data
     return (
         ctx["cfg"],
         ctx["db"],
         ctx["twc"],
+        ctx["slctl"],
         ctx["stats"],
         ctx["notify"],
         ctx["orchestrator"],
@@ -304,7 +368,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message or not update.effective_chat:
         return
     app = context.application
-    cfg, db, twc, stats, notify, _orch = _ctx(app)
+    cfg, db, twc, slctl, stats, notify, _orch = _ctx(app)
     if update.effective_chat.id != cfg.group_id:
         return
     tid = update.message.message_thread_id
@@ -321,7 +385,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    cfg, db, twc, stats, notify, orch = _ctx(context.application)
+    cfg, db, twc, slctl, stats, notify, orch = _ctx(context.application)
     tid = update.message.message_thread_id if update.message else None
     low = text.lower().strip()
 
@@ -336,7 +400,7 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 "/debug — лог TWC API: полные запрос и ответ (в blockquote)",
                 "/debug -mid — краткий лог (зона, параметры ВМ, суть ответа)",
                 "/debug -low — отключить лог TWC",
-                "/account_list — список аккаунтов Timeweb",
+                "/account_list — список аккаунтов (Timeweb / Selectel)",
                 "/account_mng имя — карточка и флаги: -on -off -heal -day -month -balance",
                 "/drop — docker compose down",
                 "/restart — пересоздать контейнеры (force-recreate)",
@@ -408,7 +472,7 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     async def _acc_reply(html: str) -> None:
         await notify.terminal_reply(tid, html)
 
-    if await handle_account_terminal_commands(cfg, db, twc, text, _acc_reply):
+    if await handle_account_terminal_commands(cfg, db, twc, slctl, text, _acc_reply):
         return
 
     if low == "/modules":
@@ -532,37 +596,64 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 
 
 async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    cfg, db, twc, stats, notify, _orch = _ctx(context.application)
+    cfg, db, twc, slctl, stats, notify, _orch = _ctx(context.application)
     tid = update.message.message_thread_id if update.message else None
 
     async def _vreply(html: str) -> None:
         await notify.accountverify_reply(tid, html)
 
-    if await handle_account_terminal_commands(cfg, db, twc, text, _vreply):
+    if await handle_account_terminal_commands(cfg, db, twc, slctl, text, _vreply):
         return
 
     m = RE_ACCOUNT_ADD.match(text)
     if m:
-        name, key = _split_name_key(m.group(1))
+        prov_raw = (m.group(1) or "").strip().lower()
+        rest = (m.group(2) or "").strip()
+        name, key = _split_name_key(rest)
         if not name or not key:
-            await notify.accountverify_reply(tid, "Формат: " + code("/account_add имя:apiKey"))
+            await notify.accountverify_reply(
+                tid,
+                "Формат: "
+                + code("/account_add timeweb имя:apiKey")
+                + " или "
+                + code("/account_add selectel имя:IAM-токен"),
+            )
             return
-        try:
-            fin = await twc.get_finances(key)
-            bal, cur = finances_balance_rubles(fin)
-        except Exception as ex:
-            await notify.accountverify_reply(tid, f"❌ API ключ не подошёл: {esc(str(ex)[:400])}")
-            return
-        await db.add_account(name, key)
-        row = await sync_account(db, twc, cfg, name)
+        if prov_raw in ("selectel", "slctl"):
+            prov = "selectel"
+        else:
+            prov = "timeweb"
+        bal: float | None = None
+        cur: str | None = None
+        if prov == "selectel":
+            try:
+                await slctl.validate_token(key)
+                bal, cur = await slctl.get_balance_rub(key)
+            except Exception as ex:
+                await notify.accountverify_reply(
+                    tid,
+                    "❌ Selectel IAM-токен не подошёл (нужен X-Auth-Token сервисного пользователя): "
+                    + esc(str(ex)[:500]),
+                )
+                return
+        else:
+            try:
+                fin = await twc.get_finances(key)
+                bal, cur = finances_balance_rubles(fin)
+            except Exception as ex:
+                await notify.accountverify_reply(tid, f"❌ API ключ не подошёл: {esc(str(ex)[:400])}")
+                return
+        await db.add_account(name, key, provider=prov)
+        row = await sync_account(db, twc, slctl, cfg, name)
         em = row.acc_email if row else None
         lg = row.acc_login if row else None
         fn = row.acc_full_name if row else None
+        prov_label = "Selectel" if prov == "selectel" else "Timeweb"
         await notify.accountverify_reply(
             tid,
             "\n".join(
                 [
-                    "✅ " + bold("Аккаунт подключён"),
+                    "✅ " + bold("Аккаунт подключён") + f" ({prov_label})",
                     "┈ " + bold("Имя в боте") + f" {code(name)}",
                     "┈ " + bold("Email") + f" {code(em or '—')}",
                     "┈ " + bold("ФИО") + f" {code(fn or '—')}",
@@ -581,7 +672,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             await notify.accountverify_reply(tid, "Не найден: " + code(name))
             return
         try:
-            synced = await sync_account(db, twc, cfg, name)
+            synced = await sync_account(db, twc, slctl, cfg, name)
             if synced:
                 row = synced
         except Exception:
@@ -595,16 +686,40 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         if row.limited_by_month and row.limited_by_month_ts:
             lm = max(0, int(row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC - now))
             left_m = f"{lm // 3600}ч {(lm % 3600) // 60}м"
+        left_rate = "—"
+        if row.slctl_rate_until and now < row.slctl_rate_until:
+            lr = max(0, int(row.slctl_rate_until - now))
+            left_rate = f"{lr // 60}м {lr % 60}с"
         bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
-        mode_ip = (
-            "📡 плавающий IPv4 (без ВМ)"
-            if account_prefers_floating_ip_probe(row)
-            else "🖥 облачная ВМ"
+        if row.provider == "selectel":
+            mode_ip = "🖥 Selectel Nova (публичный IPv4)"
+        else:
+            mode_ip = (
+                "📡 плавающий IPv4 (без ВМ)"
+                if account_prefers_floating_ip_probe(row)
+                else "🖥 облачная ВМ Timeweb"
+            )
+        res_lines = (
+            await _slctl_account_resources_block(db, slctl, cfg, row)
+            if row.provider == "selectel"
+            else await _twc_account_resources_block(db, twc, row)
         )
-        res_lines = await _twc_account_resources_block(db, twc, row)
+        lim_lines: list[str] = []
+        if row.provider != "selectel":
+            lim_lines = [
+                "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
+                "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
+            ]
+        else:
+            lim_lines = [
+                "┈ "
+                + bold("Пауза API (429/503)")
+                + f": {'⚠️ да' if (row.slctl_rate_until and now < row.slctl_rate_until) else '✅ нет'} (~{left_rate})",
+            ]
         body = "\n".join(
             [
                 "🪪 " + bold("Карточка аккаунта") + f" {code(name)}",
+                "┈ " + bold("Провайдер") + f": {code('Selectel' if row.provider == 'selectel' else 'Timeweb')}",
                 "┈ " + bold("Email") + f": {code(row.acc_email or '—')}",
                 "┈ " + bold("ФИО (личные данные)") + f": {code(row.acc_full_name or '—')}",
                 "┈ " + bold("Login") + f": {code(row.acc_login or '—')}",
@@ -612,8 +727,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                 "┈ " + bold("Режим перебора") + f": {mode_ip}",
                 "┈ " + bold("В подборе") + f": {'✅ да' if row.brute_enabled else '❌ нет'}",
                 "┈ " + bold("Лимит баланса") + f": {'⚠️ да' if row.limited_by_balance else '✅ нет'}",
-                "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
-                "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
+                *lim_lines,
                 "",
                 *res_lines,
             ]
@@ -650,7 +764,9 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         "\n".join(
             [
                 bold("Команды аккаунтов"),
-                code("/account_add имя:ключ"),
+                code("/account_add timeweb имя:apiKey")
+                + " · "
+                + code("/account_add selectel имя:IAM-токен"),
                 code("/account_info имя"),
                 code("/account_list"),
                 code("/account_mng имя") + " и флаги " + code("-on -off -heal -day -month -balance"),

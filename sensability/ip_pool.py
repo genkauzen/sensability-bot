@@ -4,6 +4,34 @@ import ipaddress
 from functools import lru_cache
 from pathlib import Path
 
+import httpx
+
+
+def merge_ipv4_networks(
+    *groups: tuple[ipaddress.IPv4Network, ...],
+) -> tuple[ipaddress.IPv4Network, ...]:
+    out: list[ipaddress.IPv4Network] = []
+    for g in groups:
+        out.extend(g)
+    return tuple(out)
+
+
+def parse_cidr_text(text: str) -> tuple[ipaddress.IPv4Network, ...]:
+    nets: list[ipaddress.IPv4Network] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        nets.append(ipaddress.ip_network(s, strict=False))
+    return tuple(nets)
+
+
+def fetch_cidr_networks_from_url(url: str, *, timeout: float = 25.0) -> tuple[ipaddress.IPv4Network, ...]:
+    with httpx.Client(timeout=timeout) as c:
+        r = c.get(url)
+        r.raise_for_status()
+    return parse_cidr_text(r.text)
+
 
 @lru_cache(maxsize=1)
 def load_networks(subnets_file: str) -> tuple[ipaddress.IPv4Network, ...]:

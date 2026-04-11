@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_sync_ts REAL,
     acc_full_name TEXT,
     whitelist_servers TEXT,
-    whitelist_floats TEXT
+    whitelist_floats TEXT,
+    provider TEXT NOT NULL DEFAULT 'timeweb',
+    slctl_rate_until REAL,
+    whitelist_slctl TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -60,6 +63,9 @@ class AccountRow:
     acc_full_name: str | None
     whitelist_servers: str | None
     whitelist_floats: str | None
+    provider: str
+    slctl_rate_until: float | None
+    whitelist_slctl: str | None
 
 
 def _row_to_account(r: aiosqlite.Row) -> AccountRow:
@@ -80,6 +86,9 @@ def _row_to_account(r: aiosqlite.Row) -> AccountRow:
         acc_full_name=_col(r, "acc_full_name"),
         whitelist_servers=_col(r, "whitelist_servers"),
         whitelist_floats=_col(r, "whitelist_floats"),
+        provider=str(_col(r, "provider") or "timeweb"),
+        slctl_rate_until=_col(r, "slctl_rate_until"),
+        whitelist_slctl=_col(r, "whitelist_slctl"),
     )
 
 
@@ -109,25 +118,35 @@ class Database:
             ("acc_full_name", "TEXT"),
             ("whitelist_servers", "TEXT"),
             ("whitelist_floats", "TEXT"),
+            ("provider", "TEXT"),
+            ("slctl_rate_until", "REAL"),
+            ("whitelist_slctl", "TEXT"),
         ):
             if col not in have:
-                await self._db.execute(f"ALTER TABLE accounts ADD COLUMN {col} {sql_typ}")
+                default = ""
+                if col == "provider":
+                    default = " DEFAULT 'timeweb'"
+                await self._db.execute(f"ALTER TABLE accounts ADD COLUMN {col} {sql_typ}{default}")
+        await self._db.execute(
+            "UPDATE accounts SET provider='timeweb' WHERE provider IS NULL OR provider=''"
+        )
 
     async def close(self) -> None:
         await self._db.close()
 
-    async def add_account(self, name: str, api_key: str) -> None:
+    async def add_account(self, name: str, api_key: str, provider: str = "timeweb") -> None:
         now = time.time()
         await self._db.execute(
             """
-            INSERT INTO accounts (name, api_key, brute_enabled, last_sync_ts)
-            VALUES (?, ?, 1, ?)
+            INSERT INTO accounts (name, api_key, brute_enabled, last_sync_ts, provider)
+            VALUES (?, ?, 1, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 api_key=excluded.api_key,
                 brute_enabled=1,
-                last_sync_ts=excluded.last_sync_ts
+                last_sync_ts=excluded.last_sync_ts,
+                provider=excluded.provider
             """,
-            (name, api_key, now),
+            (name, api_key, now, provider),
         )
         await self._db.commit()
 
@@ -177,6 +196,8 @@ class Database:
                 "acc_full_name",
                 "whitelist_servers",
                 "whitelist_floats",
+                "slctl_rate_until",
+                "whitelist_slctl",
             }
         )
         fields = {k: v for k, v in fields.items() if k in allowed}
@@ -202,7 +223,8 @@ class Database:
                 limited_by_month=0,
                 limited_by_month_ts=NULL,
                 limited_by_day=0,
-                limited_by_day_ts=NULL
+                limited_by_day_ts=NULL,
+                slctl_rate_until=NULL
             WHERE name=?
             """,
             (name,),
@@ -238,6 +260,30 @@ class Database:
         if floating_ip_id not in cur:
             cur.append(floating_ip_id)
         await self.patch_account(name, {"whitelist_floats": json.dumps(cur)})
+
+    async def append_whitelist_slctl(self, name: str, server_id: str) -> None:
+        row = await self.get_account(name)
+        if not row:
+            return
+        try:
+            cur = json.loads(row.whitelist_slctl or "[]")
+        except json.JSONDecodeError:
+            cur = []
+        if not isinstance(cur, list):
+            cur = []
+        sid = str(server_id).strip()
+        if sid and sid not in cur:
+            cur.append(sid)
+        await self.patch_account(name, {"whitelist_slctl": json.dumps(cur)})
+
+    def whitelist_slctl_ids(self, row: AccountRow) -> list[str]:
+        try:
+            raw = json.loads(row.whitelist_slctl or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if x is not None and str(x).strip()]
 
     def whitelist_server_ids(self, row: AccountRow) -> list[int]:
         try:

@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from sensability.slctl_constants import DEFAULT_SLCTL_EXTRA_CIDR_URL
+
 
 def _bool(v: str | None, default: bool = False) -> bool:
     if v is None or v.strip() == "":
@@ -63,6 +65,15 @@ class Config:
     twc_minimum_rubles: float
     twc_vm_alivetime_minutes: int
     db_sync_time_minutes: int
+    slctl_proxy_use: bool
+    slctl_proxy_url: str | None
+    slctl_ip_location: str
+    slctl_atmoment_acc: int
+    slctl_minimum_rubles: float
+    slctl_whitelist_cidr_url: str | None
+    slctl_flavor_id: str | None
+    slctl_image_id: str | None
+    slctl_network_uuid: str | None
     data_dir: Path
     compose_dir: Path
     subnets_path: Path
@@ -123,6 +134,16 @@ def load_config() -> Config:
         twc_minimum_rubles=_float(os.getenv("TWC_MINIMUM_RUBLES"), 0.0),
         twc_vm_alivetime_minutes=max(1, _int(os.getenv("TWC_VM_ALIVETIME"), 5)),
         db_sync_time_minutes=max(1, _int(os.getenv("DB_SYNC_TIME"), 5)),
+        slctl_proxy_use=_bool(os.getenv("SLCTL_PROXY_USE"), False),
+        slctl_proxy_url=(os.getenv("SLCTL_PROXY_URL") or "").strip() or None,
+        slctl_ip_location=(os.getenv("SLCTL_IP_LOCATION") or "ru-7").strip(),
+        slctl_atmoment_acc=max(1, _int(os.getenv("SLCTL_ATMOMENT_ACC"), 2)),
+        slctl_minimum_rubles=_float(os.getenv("SLCTL_MINIMUM_RUBLES"), 0.0),
+        slctl_whitelist_cidr_url=(os.getenv("SLCTL_WHITELIST_CIDR_URL") or "").strip()
+        or DEFAULT_SLCTL_EXTRA_CIDR_URL,
+        slctl_flavor_id=(os.getenv("SLCTL_FLAVOR_ID") or "").strip() or None,
+        slctl_image_id=(os.getenv("SLCTL_IMAGE_ID") or "").strip() or None,
+        slctl_network_uuid=(os.getenv("SLCTL_NETWORK_UUID") or "").strip() or None,
         data_dir=data_dir,
         compose_dir=compose,
         subnets_path=subnets,

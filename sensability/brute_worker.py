@@ -23,6 +23,14 @@ from sensability.twc_constants import (
     TWC_OS_ID,
     TWC_PRESET_ID,
 )
+from sensability.slctl_constants import SLCTL_RATE_COOLDOWN_SEC
+from sensability.slctl_client import (
+    SelectelClient,
+    SlctlApiError,
+    extract_public_ipv4_from_nova_server,
+    is_slctl_rate_limit_error,
+    parse_error_message as slctl_parse_error_message,
+)
 from sensability.twc_client import (
     TimewebApiError,
     extract_ipv4_from_floating_record,
@@ -52,19 +60,24 @@ class BruteOrchestrator:
         cfg: Config,
         db: Database,
         twc: TimewebClient,
+        slctl: SelectelClient,
         stats: StatsCollector,
         notify: TelegramNotify,
         networks: tuple,
         potential_networks: tuple,
+        networks_selectel: tuple,
     ) -> None:
         self.cfg = cfg
         self.db = db
         self.twc = twc
+        self.slctl = slctl
         self.stats = stats
         self.notify = notify
         self._networks = networks
         self._potential_networks = potential_networks
-        self._sem = asyncio.Semaphore(cfg.twc_atmoment_acc)
+        self._networks_selectel = networks_selectel
+        self._sem_twc = asyncio.Semaphore(cfg.twc_atmoment_acc)
+        self._sem_slctl = asyncio.Semaphore(cfg.slctl_atmoment_acc)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
@@ -93,13 +106,19 @@ class BruteOrchestrator:
             body["availability_zone"] = zone
         return body
 
-    def _ip_live_extra_lines(self, pub_ip: str | None) -> list[str]:
+    def _ip_live_extra_lines(
+        self,
+        pub_ip: str | None,
+        *,
+        pool_networks: tuple | None = None,
+    ) -> list[str]:
+        nets = pool_networks if pool_networks is not None else self._networks
         if not pub_ip:
             return [
                 "┈ " + bold("Пул ПНА") + ": —",
                 "┈ " + bold("Потенциал (±2 к октетам)") + ": —",
             ]
-        in_pool = ipv4_in_pool(pub_ip, self._networks)
+        in_pool = ipv4_in_pool(pub_ip, nets)
         pot = (
             ipv4_in_any_potential(pub_ip, self._potential_networks, delta=2)
             if self._potential_networks
@@ -145,16 +164,22 @@ class BruteOrchestrator:
     async def run_once_account(self, name: str) -> None:
         if self._brute_paused:
             return
-        async with self._sem:
+        row0 = await sync_account(self.db, self.twc, self.slctl, self.cfg, name)
+        if not row0:
+            return
+        sem = self._sem_slctl if row0.provider == "selectel" else self._sem_twc
+        async with sem:
             if self._brute_paused:
                 return
-            row = await sync_account(self.db, self.twc, self.cfg, name)
+            row = await sync_account(self.db, self.twc, self.slctl, self.cfg, name)
             if not row:
                 return
             if not account_eligible_for_brute(row, self.cfg):
                 return
 
-            if account_prefers_floating_ip_probe(row):
+            if row.provider == "selectel":
+                await self._run_brute_selectel(name, row)
+            elif account_prefers_floating_ip_probe(row):
                 await self._run_brute_floating_ip(name, row)
             else:
                 await self._run_brute_vm(name, row)
@@ -535,6 +560,171 @@ class BruteOrchestrator:
                 {"ip": pub_ip, "floating_ip_id": fid},
             )
 
+    async def _run_brute_selectel(self, name: str, row: AccountRow) -> None:
+        await self.stats.track_account(name, row.balance_cached)
+        reg = self.cfg.slctl_ip_location.strip()
+        vm_name = f"{self.cfg.twc_vm_name}-slctl-{row.name}-{uuid.uuid4().hex[:8]}"
+        flavor = self.cfg.slctl_flavor_id
+        image = self.cfg.slctl_image_id
+        net_uuid = self.cfg.slctl_network_uuid
+
+        if self.cfg.full_logs:
+            await self.notify.logs(
+                f"{bold('Selectel')} <code>Nova POST /servers</code> · {esc(name)} · {code(reg)}"
+            )
+
+        try:
+            data = await self.slctl.create_server(
+                row.api_key,
+                reg,
+                vm_name,
+                flavor_ref=flavor,
+                image_ref=image,
+                network_uuid=net_uuid,
+            )
+        except SlctlApiError as e:
+            msg = slctl_parse_error_message(e)
+            if self.cfg.full_logs:
+                await self.notify.logs(f"{bold('Selectel ошибка')} {e.status}: {esc(msg[:800])}")
+            if is_slctl_rate_limit_error(e.status):
+                await self.db.patch_account(
+                    name,
+                    {"slctl_rate_until": time.time() + SLCTL_RATE_COOLDOWN_SEC},
+                )
+                await self.db.log_event("slctl_rate_limit", name, {"status": e.status, "msg": msg[:2000]})
+                return
+            await self.stats.add_vm_fail()
+            await self.db.log_event("slctl_create_fail", name, {"status": e.status, "msg": msg[:2000]})
+            return
+
+        await self.stats.add_vm_ok()
+        srv_wrap = data.get("server") if isinstance(data, dict) else None
+        if not isinstance(srv_wrap, dict):
+            await self.stats.add_vm_fail()
+            return
+        sid = str(srv_wrap.get("id") or "").strip()
+        if not sid:
+            await self.stats.add_vm_fail()
+            return
+
+        pub_ip: str | None = None
+        notfound_streak = 0
+        for _ in range(POLL_ATTEMPTS):
+            if self._stop.is_set() or self._brute_paused:
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+            await self.stats.add_ipv4_check()
+            try:
+                s = await self.slctl.get_server(row.api_key, reg, sid)
+                pub_ip = extract_public_ipv4_from_nova_server(s)
+            except SlctlApiError as ex:
+                msg = slctl_parse_error_message(ex)
+                if is_slctl_rate_limit_error(ex.status):
+                    await self.db.patch_account(
+                        name,
+                        {"slctl_rate_until": time.time() + SLCTL_RATE_COOLDOWN_SEC},
+                    )
+                    await self.db.log_event("slctl_rate_limit_poll", name, {"msg": msg[:800]})
+                    try:
+                        await self.slctl.delete_server(row.api_key, reg, sid)
+                    except Exception:
+                        pass
+                    return
+                if ex.status == 404:
+                    notfound_streak += 1
+                    if notfound_streak >= NOTFOUND_GIVEUP:
+                        await self.db.log_event("slctl_server_gone", name, {"server_id": sid})
+                        return
+                elif self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('poll nova')} {esc(name)}: {esc(str(ex)[:200])}")
+            except Exception as ex:
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('poll nova')} {esc(name)}: {esc(str(ex)[:200])}")
+            if pub_ip:
+                break
+
+        live_s = [
+            "🖥 " + bold("Live — Selectel Nova"),
+            "┈ " + bold("Аккаунт") + f" {code(name)}",
+            "┈ " + bold("Регион") + f" {code(reg)}",
+            "┈ " + bold("IPv4") + f" {code(pub_ip or '—')}",
+        ]
+        live_s.extend(self._ip_live_extra_lines(pub_ip, pool_networks=self._networks_selectel))
+        await self.notify.live("\n".join(live_s))
+
+        if not pub_ip:
+            if notfound_streak >= NOTFOUND_GIVEUP:
+                return
+            try:
+                await self.slctl.delete_server(row.api_key, reg, sid)
+            except SlctlApiError as ex:
+                if ex.status != 404:
+                    await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
+            except Exception as ex:
+                await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
+            await self.db.log_event("slctl_no_ipv4", name, {"server_id": sid})
+            return
+
+        if ipv4_in_pool(pub_ip, self._networks_selectel):
+            await self.stats.add_pool_hit()
+            await self.db.patch_account(name, {"brute_enabled": 0})
+            await self.db.append_whitelist_slctl(name, sid)
+            await self.db.log_event("pool_hit_slctl", name, {"ip": pub_ip, "server_id": sid})
+            msg = "\n".join(
+                [
+                    "🎯 " + bold("Попадание в ПНА"),
+                    "🖥 " + bold("Режим") + " Selectel Nova",
+                    "┈ " + bold("Аккаунт") + f" {code(name)}",
+                    "┈ " + bold("Публичный IPv4") + f" {code(pub_ip)}",
+                    "┈ " + bold("Сервер id") + f" {code(sid)} — в белом списке",
+                ]
+            )
+            await self.notify.totalresult(msg)
+            asyncio.create_task(
+                self._delete_slctl_later(row.api_key, reg, sid, name),
+                name=f"slctl-del-{sid[:8]}",
+            )
+        else:
+            await self.stats.add_vm_deleted_no_pool()
+            try:
+                await self.slctl.delete_server(row.api_key, reg, sid)
+            except SlctlApiError as ex:
+                if ex.status != 404:
+                    await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
+            except Exception as ex:
+                await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
+            await self.db.log_event("slctl_ip_not_in_pool", name, {"ip": pub_ip, "server_id": sid})
+
+    async def _delete_slctl_later(self, api_key: str, region: str, server_id: str, acc_name: str) -> None:
+        delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
+        await asyncio.sleep(delay)
+        row = await self.db.get_account(acc_name)
+        if row and server_id in self.db.whitelist_slctl_ids(row):
+            await self.notify.logs(
+                "🔒 "
+                + bold("Selectel ВМ в белом списке")
+                + f" {code(server_id)} — удаление по таймеру отменено."
+            )
+            return
+        try:
+            await self.slctl.delete_server(api_key, region, server_id)
+            await self.notify.logs(
+                "\n".join(
+                    [
+                        "⏱ " + bold("Selectel ВМ удалена по таймеру"),
+                        f"Аккаунт: {code(acc_name)}",
+                        f"id: {code(server_id)}",
+                    ]
+                )
+            )
+            await self.db.log_event("slctl_deleted_timer", acc_name, {"server_id": server_id})
+        except SlctlApiError as ex:
+            if ex.status == 404:
+                return
+            await self.notify.logs(f"{bold('Удаление Nova')}: {esc(str(ex)[:400])}")
+        except Exception as ex:
+            await self.notify.logs(f"{bold('Удаление Nova')}: {esc(str(ex)[:400])}")
+
     async def _delete_float_later(self, api_key: str, floating_ip_id: str, acc_name: str) -> None:
         delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
         await asyncio.sleep(delay)
@@ -611,7 +801,7 @@ class BruteOrchestrator:
                 last_sync = now
                 for acc in await self.db.list_accounts():
                     try:
-                        await sync_account(self.db, self.twc, self.cfg, acc.name)
+                        await sync_account(self.db, self.twc, self.slctl, self.cfg, acc.name)
                     except Exception:
                         log.exception("sync %s", acc.name)
             want = {a.name for a in await self.db.list_brute_accounts()}
