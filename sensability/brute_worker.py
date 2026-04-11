@@ -17,7 +17,6 @@ from sensability.twc_constants import (
     TWC_BANDWIDTH,
     TWC_OS_ID,
     TWC_PRESET_ID,
-    location_for_availability_zone,
 )
 from sensability.twc_client import (
     TimewebApiError,
@@ -68,8 +67,7 @@ class BruteOrchestrator:
 
     def _build_create_body(self, vm_name: str) -> dict:
         zone = self.cfg.twc_vm_region.strip()
-        loc = location_for_availability_zone(zone)
-        body: dict = {
+        return {
             "name": vm_name,
             "preset_id": TWC_PRESET_ID,
             "os_id": TWC_OS_ID,
@@ -79,9 +77,6 @@ class BruteOrchestrator:
             "comment": "sensability",
             "availability_zone": zone,
         }
-        if loc:
-            body["location"] = loc
-        return body
 
     async def run_once_account(self, name: str) -> None:
         if self._brute_paused:
