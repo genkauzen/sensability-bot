@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -162,6 +163,24 @@ def format_keystone_error(exc: SlctlApiError) -> str:
     return parse_error_message(exc)[:800]
 
 
+def _keystone_project_id_from_validate_response(data: dict[str, Any]) -> str | None:
+    """UUID проекта из GET /auth/tokens (нужен Neutron для tenant_id при «облегчённой» AuthN)."""
+    tok = data.get("token")
+    if not isinstance(tok, dict):
+        return None
+    proj = tok.get("project")
+    if isinstance(proj, dict):
+        pid = str(proj.get("id") or "").strip()
+        if pid:
+            return pid
+    user = tok.get("user")
+    if isinstance(user, dict):
+        dpid = str(user.get("default_project_id") or "").strip()
+        if dpid:
+            return dpid
+    return None
+
+
 def _pick_catalog_url(catalog: list[dict[str, Any]], service_type: str, region: str) -> str | None:
     for cat in catalog:
         if cat.get("type") != service_type:
@@ -247,7 +266,7 @@ class SelectelClient:
             headers={"Accept": "application/json"},
             follow_redirects=True,
         )
-        self._endpoint_cache: dict[tuple[str, str], tuple[str, str]] = {}
+        self._endpoint_cache: dict[tuple[str, str], tuple[str, str, str | None]] = {}
         self._image_endpoint_cache: dict[tuple[str, str], str | None] = {}
 
     async def aclose(self) -> None:
@@ -338,10 +357,33 @@ class SelectelClient:
                 }
             },
         }
-        variants: list[dict[str, Any]] = [
-            {"auth": {**{"identity": identity_block}, "scope": {"domain": {"name": dom}}}},
-            {"auth": {"identity": identity_block}},
-        ]
+        proj_id_env = (os.getenv("SLCTL_OS_PROJECT_ID") or "").strip()
+        proj_name_env = (os.getenv("SLCTL_KEYSTONE_PROJECT_NAME") or "").strip()
+        variants: list[dict[str, Any]] = []
+        if proj_id_env:
+            variants.append(
+                {
+                    "auth": {
+                        "identity": identity_block,
+                        "scope": {"project": {"id": proj_id_env}},
+                    }
+                }
+            )
+        if proj_name_env:
+            variants.append(
+                {
+                    "auth": {
+                        "identity": identity_block,
+                        "scope": {"project": {"domain": {"name": dom}, "name": proj_name_env}},
+                    }
+                }
+            )
+        variants.extend(
+            [
+                {"auth": {**{"identity": identity_block}, "scope": {"domain": {"name": dom}}}},
+                {"auth": {"identity": identity_block}},
+            ]
+        )
         last_exc: SlctlApiError | None = None
         for body in variants:
             r = await self._client.post(
@@ -384,11 +426,12 @@ class SelectelClient:
             raise SlctlApiError(r.status_code, body or "empty", None)
         return parsed
 
-    async def get_catalog_endpoints(self, token: str, region: str) -> tuple[str, str]:
+    async def get_catalog_endpoints(self, token: str, region: str) -> tuple[str, str, str | None]:
         k = (token[:48], region)
         if k in self._endpoint_cache:
             return self._endpoint_cache[k]
         data = await self.validate_token(token)
+        project_id = _keystone_project_id_from_validate_response(data)
         tok = data.get("token")
         catalog = tok.get("catalog") if isinstance(tok, dict) else None
         if not isinstance(catalog, list):
@@ -399,8 +442,8 @@ class SelectelClient:
             compute = f"https://{region}.cloud.api.selcloud.ru/v2.1"
         if not network:
             network = f"https://{region}.cloud.api.selcloud.ru"
-        self._endpoint_cache[k] = (compute, network)
-        return compute, network
+        self._endpoint_cache[k] = (compute, network, project_id)
+        return compute, network, project_id
 
     async def get_image_catalog_url(self, token: str, region: str) -> str | None:
         k = (token[:48], region)
@@ -578,7 +621,7 @@ class SelectelClient:
         image_ref: str | None,
         network_uuid: str | None,
     ) -> dict[str, Any]:
-        compute, network_base = await self.get_catalog_endpoints(token, region)
+        compute, network_base, _ = await self.get_catalog_endpoints(token, region)
         assert compute
         if not flavor_ref:
             flavor_ref = await self.pick_flavor_id(token, compute)
@@ -607,19 +650,19 @@ class SelectelClient:
         return await self._request("POST", url, token=token, json_body=body)
 
     async def get_server(self, token: str, region: str, server_id: str) -> dict[str, Any]:
-        compute, _ = await self.get_catalog_endpoints(token, region)
+        compute, _, _ = await self.get_catalog_endpoints(token, region)
         url = f"{compute.rstrip('/')}/servers/{server_id}"
         data = await self._request("GET", url, token=token)
         srv = data.get("server") if isinstance(data, dict) else None
         return srv if isinstance(srv, dict) else {}
 
     async def delete_server(self, token: str, region: str, server_id: str) -> None:
-        compute, _ = await self.get_catalog_endpoints(token, region)
+        compute, _, _ = await self.get_catalog_endpoints(token, region)
         url = f"{compute.rstrip('/')}/servers/{server_id}"
         await self._request("DELETE", url, token=token)
 
     async def list_servers(self, token: str, region: str) -> list[dict[str, Any]]:
-        compute, _ = await self.get_catalog_endpoints(token, region)
+        compute, _, _ = await self.get_catalog_endpoints(token, region)
         url = f"{compute.rstrip('/')}/servers/detail"
         data = await self._request("GET", url, token=token)
         srvs = data.get("servers") if isinstance(data, dict) else None
@@ -640,11 +683,14 @@ class SelectelClient:
         *,
         description: str | None = None,
     ) -> dict[str, Any]:
-        _, network_base = await self.get_catalog_endpoints(token, region)
+        _, network_base, project_id = await self.get_catalog_endpoints(token, region)
         ext_id = await self.find_external_network_id(token, network_base)
         if not ext_id:
             raise SlctlApiError(400, "Не найдена external-сеть Neutron для плавающего IP", None)
         body: dict[str, Any] = {"floatingip": {"floating_network_id": ext_id}}
+        tenant_id = (project_id or "").strip() or (os.getenv("SLCTL_OS_PROJECT_ID") or "").strip()
+        if tenant_id:
+            body["floatingip"]["tenant_id"] = tenant_id
         if description:
             body["floatingip"]["description"] = str(description)[:240]
         url = f"{network_base.rstrip('/')}/v2.0/floatingips"
@@ -652,18 +698,18 @@ class SelectelClient:
         return self.floating_ip_record(data)
 
     async def get_floating_ip(self, token: str, region: str, fip_id: str) -> dict[str, Any]:
-        _, network_base = await self.get_catalog_endpoints(token, region)
+        _, network_base, _ = await self.get_catalog_endpoints(token, region)
         url = f"{network_base.rstrip('/')}/v2.0/floatingips/{fip_id}"
         data = await self._request("GET", url, token=token)
         return self.floating_ip_record(data)
 
     async def delete_floating_ip(self, token: str, region: str, fip_id: str) -> None:
-        _, network_base = await self.get_catalog_endpoints(token, region)
+        _, network_base, _ = await self.get_catalog_endpoints(token, region)
         url = f"{network_base.rstrip('/')}/v2.0/floatingips/{fip_id}"
         await self._request("DELETE", url, token=token)
 
     async def list_floating_ips(self, token: str, region: str) -> list[dict[str, Any]]:
-        _, network_base = await self.get_catalog_endpoints(token, region)
+        _, network_base, _ = await self.get_catalog_endpoints(token, region)
         url = f"{network_base.rstrip('/')}/v2.0/floatingips"
         data = await self._request("GET", url, token=token)
         fis = data.get("floatingips") if isinstance(data, dict) else None
