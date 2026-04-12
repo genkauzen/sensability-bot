@@ -127,7 +127,8 @@ async def _sync_selectel(
     now = time.time()
     patch = _expire_limits(row, now)
     row = await _ensure_selectel_iam_token(db, slctl, name, row)
-    bal, cur = await slctl.get_balance_rub(row.api_key)
+    billing_xt = (row.slctl_billing_x_token or cfg.slctl_billing_x_token or "").strip() or None
+    bal, cur = await slctl.get_balance_rub(row.api_key, billing_x_token=billing_xt)
     limited_by_balance = False
     if bal is not None and bal < cfg.slctl_minimum_rubles:
         limited_by_balance = True

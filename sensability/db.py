@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     slctl_keystone_user TEXT,
     slctl_keystone_domain TEXT,
     slctl_keystone_password TEXT,
-    slctl_token_issued_ts REAL
+    slctl_token_issued_ts REAL,
+    slctl_billing_x_token TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -74,6 +75,7 @@ class AccountRow:
     slctl_keystone_domain: str | None
     slctl_keystone_password: str | None
     slctl_token_issued_ts: float | None
+    slctl_billing_x_token: str | None
 
 
 def _row_to_account(r: aiosqlite.Row) -> AccountRow:
@@ -101,6 +103,7 @@ def _row_to_account(r: aiosqlite.Row) -> AccountRow:
         slctl_keystone_domain=_col(r, "slctl_keystone_domain"),
         slctl_keystone_password=_col(r, "slctl_keystone_password"),
         slctl_token_issued_ts=_col(r, "slctl_token_issued_ts"),
+        slctl_billing_x_token=_col(r, "slctl_billing_x_token"),
     )
 
 
@@ -137,6 +140,7 @@ class Database:
             ("slctl_keystone_domain", "TEXT"),
             ("slctl_keystone_password", "TEXT"),
             ("slctl_token_issued_ts", "REAL"),
+            ("slctl_billing_x_token", "TEXT"),
         ):
             if col not in have:
                 default = ""
@@ -160,6 +164,7 @@ class Database:
         slctl_keystone_domain: str | None = None,
         slctl_keystone_password: str | None = None,
         slctl_token_issued_ts: float | None = None,
+        slctl_billing_x_token: str | None = None,
     ) -> None:
         now = time.time()
         await self._db.execute(
@@ -167,9 +172,9 @@ class Database:
             INSERT INTO accounts (
                 name, api_key, brute_enabled, last_sync_ts, provider,
                 slctl_keystone_user, slctl_keystone_domain, slctl_keystone_password,
-                slctl_token_issued_ts
+                slctl_token_issued_ts, slctl_billing_x_token
             )
-            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 api_key=excluded.api_key,
                 brute_enabled=1,
@@ -178,7 +183,8 @@ class Database:
                 slctl_keystone_user=excluded.slctl_keystone_user,
                 slctl_keystone_domain=excluded.slctl_keystone_domain,
                 slctl_keystone_password=excluded.slctl_keystone_password,
-                slctl_token_issued_ts=excluded.slctl_token_issued_ts
+                slctl_token_issued_ts=excluded.slctl_token_issued_ts,
+                slctl_billing_x_token=excluded.slctl_billing_x_token
             """,
             (
                 name,
@@ -189,6 +195,7 @@ class Database:
                 slctl_keystone_domain,
                 slctl_keystone_password,
                 slctl_token_issued_ts,
+                slctl_billing_x_token,
             ),
         )
         await self._db.commit()
@@ -246,6 +253,7 @@ class Database:
                 "slctl_keystone_domain",
                 "slctl_keystone_password",
                 "slctl_token_issued_ts",
+                "slctl_billing_x_token",
             }
         )
         fields = {k: v for k, v in fields.items() if k in allowed}

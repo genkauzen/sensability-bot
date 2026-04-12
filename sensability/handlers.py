@@ -13,7 +13,12 @@ from telegram.ext import ContextTypes
 from zoneinfo import ZoneInfo
 
 from sensability.account_sync import account_prefers_floating_ip_probe, sync_account
-from sensability.slctl_client import SelectelClient, extract_public_ipv4_from_nova_server
+from sensability.slctl_client import (
+    SelectelClient,
+    SlctlApiError,
+    extract_public_ipv4_from_nova_server,
+    format_keystone_error,
+)
 from sensability.brute_worker import BruteOrchestrator
 from sensability.config import Config
 from sensability.db import AccountRow, Database
@@ -46,6 +51,7 @@ RE_ACCOUNT_DISABLE = re.compile(r"^/(?:account_disable|accont_disable)\s+(\S+)\s
 RE_ACCOUNT_ENABLE = re.compile(r"^/account_enable\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_HEAL = re.compile(r"^/account_heal\s+(\S+)\s*$", re.I)
 RE_ACCOUNT_MNG = re.compile(r"^/account_mng\s+(\S+)(?:\s+(.*))?$", re.I)
+RE_SLCTL_BILLING_XTOKEN = re.compile(r"\s+xtoken:(\S+)\s*$", re.I)
 
 
 def _twc_account_resources_lines(
@@ -190,8 +196,15 @@ def _parse_selectel_account_add(rest: str) -> dict[str, Any] | None:
     Пример: v1880:myuser 573082:SecretPass@here
 
     Режим готового токена: «имя:IAM_токен» (один фрагмент, как раньше).
+
+    Опционально в конце: «xtoken:статический_ключ_панели» для GET /v3/balances (как в экспортерах).
     """
     rest = rest.strip()
+    billing_xt: str | None = None
+    m_xt = RE_SLCTL_BILLING_XTOKEN.search(rest)
+    if m_xt:
+        billing_xt = m_xt.group(1).strip()
+        rest = RE_SLCTL_BILLING_XTOKEN.sub("", rest).strip()
     parts = rest.split(None, 1)
     if len(parts) == 2:
         left, right = parts[0].strip(), parts[1].strip()
@@ -206,11 +219,27 @@ def _parse_selectel_account_add(rest: str) -> dict[str, Any] | None:
                     "keystone_user": ku,
                     "account_domain": dom,
                     "password": pw,
+                    "billing_x_token": billing_xt,
                 }
     name, tok = _split_name_key(rest)
     if name and tok:
-        return {"mode": "token", "name": name, "iam_token": tok}
+        return {
+            "mode": "token",
+            "name": name,
+            "iam_token": tok,
+            "billing_x_token": billing_xt,
+        }
     return None
+
+
+def _slctl_resolve_billing_x_token(parsed: dict[str, Any] | None, cfg: Config) -> str | None:
+    raw = None
+    if parsed:
+        raw = parsed.get("billing_x_token")
+    if not raw:
+        raw = cfg.slctl_billing_x_token
+    s = str(raw).strip() if raw else ""
+    return s or None
 
 
 async def handle_account_terminal_commands(
@@ -678,6 +707,12 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                             + bold("Готовый IAM-токен")
                             + " — "
                             + code("/account_add selectel имя:токен"),
+                            "• "
+                            + bold("Биллинг (стат. ключ панели)")
+                            + " — в конце "
+                            + code("xtoken:ключ")
+                            + " или .env "
+                            + code("SLCTL_BILLING_X_TOKEN"),
                         ]
                     ),
                 )
@@ -687,14 +722,28 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                 ku = str(parsed["keystone_user"])
                 dom = str(parsed["account_domain"])
                 pw = str(parsed["password"])
+                bx = _slctl_resolve_billing_x_token(parsed, cfg)
                 try:
                     key = await slctl.issue_iam_token_by_password(ku, dom, pw)
                     await slctl.validate_token(key)
-                    bal, cur = await slctl.get_balance_rub(key)
+                    bal, cur = await slctl.get_balance_rub(key, billing_x_token=bx)
                 except Exception as ex:
+                    detail = esc(str(ex)[:500])
+                    if isinstance(ex, SlctlApiError):
+                        detail = esc(format_keystone_error(ex)[:500])
+                    hint = (
+                        "\n\n"
+                        + bold("Проверьте в my.selectel.ru")
+                        + ": «Сервисные пользователи» — "
+                        + bold("точное имя")
+                        + " логина (часто короткое, не похоже на длинный ключ), "
+                        + bold("номер аккаунта")
+                        + " вверху панели как домен, пароль сервисного пользователя. "
+                        "Строка вида «…573082» в имени может быть не логином Keystone."
+                    )
                     await notify.accountverify_reply(
                         tid,
-                        "❌ Selectel Keystone (логин/домен/пароль): " + esc(str(ex)[:600]),
+                        "❌ Selectel Keystone: " + detail + hint,
                     )
                     return
                 await db.add_account(
@@ -705,21 +754,28 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                     slctl_keystone_domain=dom,
                     slctl_keystone_password=pw,
                     slctl_token_issued_ts=time.time(),
+                    slctl_billing_x_token=parsed.get("billing_x_token"),
                 )
                 await db.patch_account(name, {"acc_login": ku})
             else:
                 name = str(parsed["name"])
                 key = str(parsed["iam_token"])
+                bx = _slctl_resolve_billing_x_token(parsed, cfg)
                 try:
                     await slctl.validate_token(key)
-                    bal, cur = await slctl.get_balance_rub(key)
+                    bal, cur = await slctl.get_balance_rub(key, billing_x_token=bx)
                 except Exception as ex:
                     await notify.accountverify_reply(
                         tid,
                         "❌ Selectel IAM-токен: " + esc(str(ex)[:500]),
                     )
                     return
-                await db.add_account(name, key, provider="selectel")
+                await db.add_account(
+                    name,
+                    key,
+                    provider="selectel",
+                    slctl_billing_x_token=parsed.get("billing_x_token"),
+                )
         row = await sync_account(db, twc, slctl, cfg, name)
         em = row.acc_email if row else None
         lg = row.acc_login if row else None

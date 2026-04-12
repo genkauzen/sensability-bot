@@ -74,6 +74,7 @@ class Config:
     slctl_flavor_id: str | None
     slctl_image_id: str | None
     slctl_network_uuid: str | None
+    slctl_billing_x_token: str | None
     data_dir: Path
     compose_dir: Path
     subnets_path: Path
@@ -144,6 +145,7 @@ def load_config() -> Config:
         slctl_flavor_id=(os.getenv("SLCTL_FLAVOR_ID") or "").strip() or None,
         slctl_image_id=(os.getenv("SLCTL_IMAGE_ID") or "").strip() or None,
         slctl_network_uuid=(os.getenv("SLCTL_NETWORK_UUID") or "").strip() or None,
+        slctl_billing_x_token=(os.getenv("SLCTL_BILLING_X_TOKEN") or "").strip() or None,
         data_dir=data_dir,
         compose_dir=compose,
         subnets_path=subnets,
