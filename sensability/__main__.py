@@ -116,8 +116,19 @@ def main() -> None:
     nets_selectel = merge_ipv4_networks(nets, extra_slctl)
 
     slctl_proxy = cfg.slctl_proxy_url if cfg.slctl_proxy_use and cfg.slctl_proxy_url else None
-    slctl = SelectelClient(slctl_proxy)
-    regru = RegruClient(twc_proxy)
+    slctl_debug = TwcApiDebugController()
+    regru_debug = TwcApiDebugController()
+
+    async def terminal_api_debug_emit(html: str) -> None:
+        tid = cfg.topic_terminal
+        if tid is None:
+            return
+        await notify.terminal_reply(tid, html)
+
+    slctl = SelectelClient(
+        slctl_proxy, debug_ctrl=slctl_debug, debug_emit=terminal_api_debug_emit
+    )
+    regru = RegruClient(twc_proxy, debug_ctrl=regru_debug, debug_emit=terminal_api_debug_emit)
 
     orchestrator = BruteOrchestrator(
         cfg, db, twc, slctl, regru, stats, notify, nets, pot, nets_selectel
@@ -131,6 +142,8 @@ def main() -> None:
         slctl=slctl,
         regru=regru,
         twc_debug=twc_debug,
+        slctl_debug=slctl_debug,
+        regru_debug=regru_debug,
         stats=stats,
         notify=notify,
         orchestrator=orchestrator,

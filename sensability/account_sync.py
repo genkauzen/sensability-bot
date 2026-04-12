@@ -128,6 +128,19 @@ async def _sync_regru(
 ) -> AccountRow | None:
     now = time.time()
     patch = _expire_limits(row, now)
+    bal: float | None = None
+    try:
+        bd = await regru.get_balance_data(row.api_key)
+        if bd and bd.get("balance") is not None:
+            bal = float(bd["balance"])
+    except Exception:
+        pass
+    limited_by_balance = False
+    if bal is not None and bal < cfg.regru_minimum_rubles:
+        limited_by_balance = True
+    patch["balance_cached"] = bal
+    patch["currency"] = "RUB"
+    patch["limited_by_balance"] = 1 if limited_by_balance else 0
     await db.patch_account(name, patch)
     row2 = await db.get_account(name)
     if not row2:
@@ -197,6 +210,8 @@ def account_eligible_for_brute(row: AccountRow, cfg: Config) -> bool:
             return False
         return True
     if row.provider == "regru":
+        if row.balance_cached is not None and row.balance_cached < cfg.regru_minimum_rubles:
+            return False
         return True
     if row.limited_by_month and row.limited_by_month_ts:
         if now < row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -13,7 +14,12 @@ from telegram.ext import ContextTypes
 from zoneinfo import ZoneInfo
 
 from sensability.account_sync import account_prefers_floating_ip_probe, sync_account
-from sensability.regru_client import RegruApiError, RegruClient, regru_is_spb_region
+from sensability.regru_client import (
+    RegruApiError,
+    RegruClient,
+    regru_ip_record_is_spb_ipv4,
+    regru_is_spb_region,
+)
 from sensability.slctl_client import (
     SelectelClient,
     SlctlApiError,
@@ -29,18 +35,26 @@ from sensability.notify import TelegramNotify
 from sensability.report import build_daily_report
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, code, esc
-from sensability.twc_constants import TWC_MONTH_LIMIT_COOLDOWN_SEC
+from sensability.twc_constants import (
+    TWC_FLOAT_IP_ZONES,
+    TWC_FLOAT_IP_ZONES_DB_KEY,
+    TWC_MONTH_LIMIT_COOLDOWN_SEC,
+)
 from sensability.twc_client import (
     TimewebClient,
     extract_ipv4_from_server,
     finances_balance_rubles,
     floating_ip_record_from_response,
+    timeweb_availability_zone_str,
+    timeweb_server_zone_label,
 )
 
 if TYPE_CHECKING:
     pass
 
 log = logging.getLogger("sensability.handlers")
+
+RE_TWC_FLOAT_ZONE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 
 RE_ACCOUNT_ADD = re.compile(
     r"^/(?:account_add_twc|account_add)\s+(?:(timeweb|twc|selectel|slctl|regru)\s+)?(.+)$",
@@ -78,7 +92,7 @@ def _twc_account_resources_lines(
             sid_i = 0
         nm = str(s.get("name") or "—")
         st = str(s.get("status") or s.get("state") or "—")
-        z = str(s.get("availability_zone") or "—")
+        z = timeweb_server_zone_label(s)
         ips = extract_ipv4_from_server(s)
         ip_s = ", ".join(ips) if ips else "—"
         wl = " · 🔒 белый список" if sid_i and sid_i in w_srv else ""
@@ -108,7 +122,11 @@ def _twc_account_resources_lines(
             addr = addr.get("ip")
         addr_s = str(addr).strip() if addr else "—"
         st = str(inner.get("status") or f.get("status") or "—")
-        z = str(inner.get("availability_zone") or f.get("availability_zone") or "—")
+        z = timeweb_availability_zone_str(inner.get("availability_zone")) or timeweb_availability_zone_str(
+            f.get("availability_zone")
+        )
+        if not z:
+            z = "—"
         wl = " · 🔒 белый список" if fid in w_fl else ""
         lines.append(f"   • {code(fid)} · {code(addr_s)} · {esc(st)} · {esc(z)}{wl}")
     if len(fl_raw) > 40:
@@ -122,6 +140,7 @@ async def _regru_account_resources_block(
     if row.provider != "regru":
         return []
     w = set(db.whitelist_regru_ids(row))
+    w_ip = set(db.whitelist_regru_ip_ids(row))
     try:
         srvs = await regru.list_reglets(row.api_key)
     except Exception as ex:
@@ -148,6 +167,24 @@ async def _regru_account_resources_block(
         lines.append(f"   • id {code(str(rid))} {code(nm)} · {esc(st)} · IPv4 {code(ip)}{wl}")
     if len(spb) > 40:
         lines.append("   … " + bold("ещё") + f" {code(str(len(spb) - 40))}")
+
+    lines.append("┈ " + bold("Доп. IPv4 (СПб)") + " — из " + code("/v1/ips"))
+    try:
+        ips = await regru.list_ips(row.api_key)
+    except Exception as ex:
+        lines.append(f"   • ❌ {esc(str(ex)[:200])}")
+        return lines
+    spb_ips = [x for x in ips if isinstance(x, dict) and regru_ip_record_is_spb_ipv4(x)]
+    for rec in spb_ips[:30]:
+        try:
+            iid = int(rec.get("id"))
+        except (TypeError, ValueError):
+            continue
+        ip_s = str(rec.get("ip") or "").strip() or "—"
+        wl = " · 🔒 белый список" if iid in w_ip else ""
+        lines.append(f"   • id {code(str(iid))} · IPv4 {code(ip_s)}{wl}")
+    if not spb_ips:
+        lines.append("   • —")
     return lines
 
 
@@ -176,6 +213,34 @@ async def _slctl_account_resources_block(
         lines.append(f"   • {code(sid)} {code(nm)} · {esc(st)} · IPv4 {code(ip)}{wl}")
     if len(srvs) > 40:
         lines.append("   … " + bold("ещё") + f" {code(str(len(srvs) - 40))}")
+
+    wf = set(db.whitelist_slctl_fip_ids(row))
+    regs = tuple(cfg.slctl_float_regions) or ("ru-7",)
+    lines.append("┈ " + bold("Neutron floating IP") + f" (регионы: {code(','.join(regs[:8]))})")
+    shown = 0
+    for rg in regs[:8]:
+        rg_s = str(rg).strip()
+        if not rg_s:
+            continue
+        try:
+            fis = await slctl.list_floating_ips(row.api_key, rg_s)
+        except Exception as ex:
+            lines.append(f"   • {code(rg_s)}: ❌ {esc(str(ex)[:120])}")
+            continue
+        for fi in fis[:25]:
+            if not isinstance(fi, dict):
+                continue
+            fid = str(fi.get("id") or "").strip() or "—"
+            ip = str(fi.get("floating_ip_address") or "").strip() or "—"
+            wl = " · 🔒 белый список" if fid in wf else ""
+            lines.append(f"   • {code(rg_s)} {code(fid)} · IPv4 {code(ip)}{wl}")
+            shown += 1
+            if shown >= 40:
+                break
+        if shown >= 40:
+            break
+    if shown == 0:
+        lines.append("   • — (пусто или нет прав Neutron в перечисленных регионах)")
     return lines
 
 
@@ -388,9 +453,12 @@ async def handle_account_terminal_commands(
         left_rate = f"{lr // 60}м {lr % 60}с"
     bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
     if row.provider == "selectel":
-        mode_ip = "🖥 Selectel Nova (публичный IPv4)"
+        mode_ip = "📡 Selectel Neutron — плавающий IPv4 (ротация ru-2/ru-7/ru-1/ru-9)"
     elif row.provider == "regru":
-        mode_ip = "🖥 Reg.ru CloudVPS — обход ВМ в СПб и ПНА (subnets.txt)"
+        mode_ip = (
+            "🖥 Reg.ru СПб: заказ доп. IPv4 к ВМ в СПб (если API разрешает), иначе — создание ВМ только в "
+            + code("openstack-spb1")
+        )
     else:
         mode_ip = (
             "📡 плавающий IPv4 (без ВМ)"
@@ -485,6 +553,42 @@ def _ctx(
     )
 
 
+def _norm_debug_flag(tok: str) -> str | None:
+    t = tok.lower().strip()
+    if t in ("-full", "full"):
+        return "full"
+    if t in ("-mid", "mid"):
+        return "mid"
+    if t in ("-low", "low"):
+        return "low"
+    return None
+
+
+def _parse_debug_command(parts: list[str]) -> tuple[str | None, str | None]:
+    if not parts or parts[0].lower() != "/debug":
+        return None, None
+    if len(parts) == 1:
+        return "timeweb", "full"
+    p1 = parts[1].lower()
+    aliases = {
+        "timeweb": "timeweb",
+        "twc": "timeweb",
+        "selectel": "selectel",
+        "slctl": "selectel",
+        "regru": "regru",
+    }
+    if p1.startswith("-"):
+        m = _norm_debug_flag(p1)
+        return ("timeweb", m) if m else (None, None)
+    if p1 not in aliases:
+        return None, None
+    svc = aliases[p1]
+    if len(parts) == 2:
+        return svc, "full"
+    m = _norm_debug_flag(parts[2])
+    return (svc, m) if m else (None, None)
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -518,9 +622,13 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 "/modules — активные компоненты",
                 "/stop — приостановить перебор IP",
                 "/continue — продолжить перебор",
-                "/debug — лог TWC API: полные запрос и ответ (в blockquote)",
-                "/debug -mid — краткий лог (зона, параметры ВМ, суть ответа)",
-                "/debug -low — отключить лог TWC",
+                "/debug [timeweb|selectel|regru] [-full|-mid|-low] — HTTP-лог в топик терминала",
+                "/debug timeweb -mid — пример; без сервиса — как раньше (Timeweb)",
+                "/timeweb mng — зоны плавающего IPv4; "
+                + code("/timeweb mng -ip spb-3")
+                + " или "
+                + code("-ip default")
+                + " (сброс)",
                 "/account_list — список аккаунтов (Timeweb / Selectel)",
                 "/account_mng имя — карточка и флаги: -on -off -heal -day -month -balance",
                 "/drop — docker compose down",
@@ -534,59 +642,136 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         return
 
     parts = text.split()
-    if parts and parts[0].lower() == "/debug":
-        dbg = context.application.bot_data.get("twc_debug")
-        if dbg is None:
-            await notify.terminal_reply(tid, "❌ " + bold("Отладка TWC") + " недоступна.")
-            return
+    if parts and parts[0].lower() == "/timeweb":
         if len(parts) == 1:
-            dbg.mode = "full"
-            label = bold("полный") + " (каждый запрос и ответ — в цитате Telegram)"
-        elif len(parts) == 2:
-            flag = parts[1].lower()
-            if flag in ("-mid", "mid"):
-                dbg.mode = "mid"
-                label = bold("средний") + " (📍 зона, ⚙️ ВМ, 📥 статус/IP без сырых JSON)"
-            elif flag in ("-low", "low"):
-                dbg.mode = "low"
-                label = bold("выкл") + " — как обычно"
-            else:
-                await notify.terminal_reply(
-                    tid,
-                    "Формат: "
-                    + code("/debug")
-                    + ", "
-                    + code("/debug -mid")
-                    + ", "
-                    + code("/debug -low"),
-                )
-                return
-        else:
             await notify.terminal_reply(
                 tid,
-                "Формат: "
-                + code("/debug")
-                + ", "
-                + code("/debug -mid")
-                + ", "
-                + code("/debug -low"),
+                bold("Timeweb")
+                + " — команды: "
+                + code("/timeweb mng")
+                + " (статус зон плавающего IPv4 и справка).",
             )
             return
+        if parts[1].lower() != "mng":
+            await notify.terminal_reply(
+                tid,
+                "Неизвестная подкоманда. Используйте " + code("/timeweb mng") + ".",
+            )
+            return
+        rest = parts[2:]
+        if not rest:
+            z_eff = await db.get_twc_float_ip_zones_for_brute()
+            custom_raw = await db.get_kv(TWC_FLOAT_IP_ZONES_DB_KEY)
+            src = (
+                bold("переопределение в БД")
+                if custom_raw is not None
+                else bold("по умолчанию") + f" ({code(', '.join(TWC_FLOAT_IP_ZONES))})"
+            )
+            await notify.terminal_reply(
+                tid,
+                "\n".join(
+                    [
+                        bold("Timeweb — зоны плавающего IPv4"),
+                        "Источник: " + src,
+                        "Перебор сейчас: " + code(", ".join(z_eff)),
+                        "",
+                        code("/timeweb mng -ip spb-3") + " — одна зона",
+                        code("/timeweb mng -ip spb-3 msk-1") + " — несколько подряд",
+                        code("/timeweb mng -ip spb-3,msk-1") + " — через запятую",
+                        code("/timeweb mng -ip default") + " — сброс к умолчанию (СПб)",
+                    ]
+                ),
+            )
+            return
+        if "-ip" not in rest:
+            await notify.terminal_reply(
+                tid,
+                "Укажите " + code("-ip …") + " или вызовите " + code("/timeweb mng") + " без аргументов.",
+            )
+            return
+        ip_i = rest.index("-ip")
+        zone_tokens: list[str] = []
+        for t in rest[ip_i + 1 :]:
+            if t.startswith("-") and t.lower() != "-ip":
+                break
+            for piece in t.split(","):
+                p = piece.strip()
+                if p:
+                    zone_tokens.append(p)
+        if not zone_tokens:
+            await notify.terminal_reply(tid, "После " + code("-ip") + " укажите хотя бы одну зону.")
+            return
+        if len(zone_tokens) == 1 and zone_tokens[0].lower() in ("default", "reset"):
+            await db.delete_kv(TWC_FLOAT_IP_ZONES_DB_KEY)
+            z_eff = await db.get_twc_float_ip_zones_for_brute()
+            await notify.terminal_reply(
+                tid,
+                "✅ Сброс к умолчанию. Перебор: " + code(", ".join(z_eff)),
+            )
+            return
+        bad = [z for z in zone_tokens if not RE_TWC_FLOAT_ZONE.match(z)]
+        if bad:
+            await notify.terminal_reply(
+                tid,
+                "Некорректные имена зон: " + ", ".join(code(x) for x in bad),
+            )
+            return
+        await db.set_kv(TWC_FLOAT_IP_ZONES_DB_KEY, json.dumps(zone_tokens, ensure_ascii=False))
+        await notify.terminal_reply(
+            tid,
+            "✅ Зоны плавающего IPv4: " + code(", ".join(zone_tokens)),
+        )
+        return
+
+    if parts and parts[0].lower() == "/debug":
+        svc_id, mode = _parse_debug_command(parts)
+        if svc_id is None or mode is None:
+            await notify.terminal_reply(
+                tid,
+                "\n".join(
+                    [
+                        bold("Формат /debug"),
+                        code("/debug") + " или " + code("/debug timeweb") + " — полный лог Timeweb",
+                        code("/debug -mid") + " — краткий Timeweb (как раньше)",
+                        code("/debug timeweb -low") + " — выкл Timeweb",
+                        code("/debug selectel -mid") + ", " + code("/debug regru -full"),
+                    ]
+                ),
+            )
+            return
+        ctrl_key = {"timeweb": "twc_debug", "selectel": "slctl_debug", "regru": "regru_debug"}[svc_id]
+        dbg = context.application.bot_data.get(ctrl_key)
+        if dbg is None:
+            await notify.terminal_reply(tid, "❌ " + bold("Отладка") + " для этого сервиса недоступна.")
+            return
+        dbg.mode = mode
+        titles = {
+            "timeweb": "Timeweb API",
+            "selectel": "Selectel API",
+            "regru": "Reg.ru CloudVPS API",
+        }
+        if mode == "full":
+            label = bold("полный") + " (запрос и ответ в цитате)"
+        elif mode == "mid":
+            label = bold("средний") + " (сжатый разбор без полного JSON)"
+        else:
+            label = bold("выкл")
         warn = ""
         if cfg.topic_terminal is None:
             warn = (
                 "\n⚠️ "
                 + bold("TOPIC_ID_TERMINAL")
-                + " не задан в .env — лог TWC в Telegram не отправится, пока не настроите топик."
+                + " не задан — лог в Telegram не уйдёт."
             )
         await notify.terminal_reply(
             tid,
             "🔧 "
-            + bold("Режим лога Timeweb API")
+            + bold("Режим лога")
+            + " "
+            + bold(titles[svc_id])
             + ": "
             + label
-            + "\n"
-            + "Сообщения идут в топик терминала (как и этот чат)."
+            + "\nСообщения идут в топик терминала."
             + warn,
         )
         return
@@ -902,6 +1087,8 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         em = row.acc_email if row else None
         lg = row.acc_login if row else None
         fn = row.acc_full_name if row else None
+        bal_s = None if not row or row.balance_cached is None else row.balance_cached
+        cur_s = (row.currency or "") if row else ""
         prov_label = (
             "Selectel"
             if prov == "selectel"
@@ -918,7 +1105,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                     "┈ " + bold("Login") + f" {code(lg or '—')}",
                     "┈ "
                     + bold("Баланс")
-                    + f" {code('—' if bal is None else str(bal))} {esc(cur or '')}",
+                    + f" {code('—' if bal_s is None else str(bal_s))} {esc(cur_s)}",
                 ]
             ),
         )
@@ -952,9 +1139,12 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             left_rate = f"{lr // 60}м {lr % 60}с"
         bal_s = "—" if row.balance_cached is None else f"{row.balance_cached:g}"
         if row.provider == "selectel":
-            mode_ip = "🖥 Selectel Nova (публичный IPv4)"
+            mode_ip = "📡 Selectel Neutron — плавающий IPv4 (ротация ru-2/ru-7/ru-1/ru-9)"
         elif row.provider == "regru":
-            mode_ip = "🖥 Reg.ru CloudVPS — обход ВМ в СПб и ПНА (subnets.txt)"
+            mode_ip = (
+                "🖥 Reg.ru СПб: заказ доп. IPv4 к ВМ в СПб (если API разрешает), иначе — создание ВМ только в "
+                + code("openstack-spb1")
+            )
         else:
             mode_ip = (
                 "📡 плавающий IPv4 (без ВМ)"

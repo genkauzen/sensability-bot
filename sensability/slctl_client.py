@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from sensability.slctl_constants import DEFAULT_SLCTL_FLAVOR_FALLBACK
+from sensability.twc_debug import (
+    TwcApiDebugController,
+    build_request_debug_html,
+    build_response_debug_html,
+)
 
 IDENTITY_URL_DEFAULT = "https://cloud.api.selcloud.ru/identity/v3"
 BILLING_BASE_DEFAULT = "https://api.selectel.ru"
@@ -224,8 +231,16 @@ def extract_public_ipv4_from_nova_server(server: dict[str, Any]) -> str | None:
 class SelectelClient:
     """IAM-токен (X-Auth-Token) + регион — Nova/Neutron по каталогу Keystone."""
 
-    def __init__(self, proxy: str | None) -> None:
+    def __init__(
+        self,
+        proxy: str | None,
+        *,
+        debug_ctrl: TwcApiDebugController | None = None,
+        debug_emit: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         self._proxy = proxy
+        self._debug_ctrl = debug_ctrl
+        self._debug_emit = debug_emit
         self._client = httpx.AsyncClient(
             proxy=proxy,
             timeout=httpx.Timeout(90.0, connect=30.0),
@@ -238,6 +253,20 @@ class SelectelClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def _emit_debug_parts(self, parts: list[str]) -> None:
+        emit = self._debug_emit
+        if not emit or not parts:
+            return
+        for chunk in parts:
+            await emit(chunk)
+
+    def _path_for_debug(self, url: str) -> str:
+        if url.startswith("http://") or url.startswith("https://"):
+            pr = urlparse(url)
+            q = ("?" + pr.query) if pr.query else ""
+            return (pr.path or "/") + q
+        return url
+
     async def _request(
         self,
         method: str,
@@ -246,6 +275,14 @@ class SelectelClient:
         token: str | None = None,
         json_body: Any = None,
     ) -> Any:
+        path_disp = self._path_for_debug(url)
+        dbg = self._debug_ctrl
+        if dbg and dbg.mode in ("full", "mid"):
+            await self._emit_debug_parts(
+                build_request_debug_html(
+                    dbg.mode, method, path_disp, json_body, service_label="Selectel"
+                )
+            )
         headers: dict[str, str] = {}
         if token:
             headers["X-Auth-Token"] = token
@@ -258,6 +295,19 @@ class SelectelClient:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
                 parsed = None
+        if dbg and dbg.mode in ("full", "mid"):
+            await self._emit_debug_parts(
+                build_response_debug_html(
+                    dbg.mode,
+                    method,
+                    path_disp,
+                    r.status_code,
+                    body,
+                    parsed,
+                    r.is_success,
+                    service_label="Selectel",
+                )
+            )
         if r.status_code >= 400:
             raise SlctlApiError(r.status_code, body, parsed)
         if parsed is not None:
@@ -574,6 +624,50 @@ class SelectelClient:
         data = await self._request("GET", url, token=token)
         srvs = data.get("servers") if isinstance(data, dict) else None
         return [x for x in srvs if isinstance(x, dict)] if isinstance(srvs, list) else []
+
+    @staticmethod
+    def floating_ip_record(data: Any) -> dict[str, Any]:
+        if isinstance(data, dict):
+            fi = data.get("floatingip")
+            if isinstance(fi, dict):
+                return fi
+        return {}
+
+    async def create_floating_ip(
+        self,
+        token: str,
+        region: str,
+        *,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        _, network_base = await self.get_catalog_endpoints(token, region)
+        ext_id = await self.find_external_network_id(token, network_base)
+        if not ext_id:
+            raise SlctlApiError(400, "Не найдена external-сеть Neutron для плавающего IP", None)
+        body: dict[str, Any] = {"floatingip": {"floating_network_id": ext_id}}
+        if description:
+            body["floatingip"]["description"] = str(description)[:240]
+        url = f"{network_base.rstrip('/')}/v2.0/floatingips"
+        data = await self._request("POST", url, token=token, json_body=body)
+        return self.floating_ip_record(data)
+
+    async def get_floating_ip(self, token: str, region: str, fip_id: str) -> dict[str, Any]:
+        _, network_base = await self.get_catalog_endpoints(token, region)
+        url = f"{network_base.rstrip('/')}/v2.0/floatingips/{fip_id}"
+        data = await self._request("GET", url, token=token)
+        return self.floating_ip_record(data)
+
+    async def delete_floating_ip(self, token: str, region: str, fip_id: str) -> None:
+        _, network_base = await self.get_catalog_endpoints(token, region)
+        url = f"{network_base.rstrip('/')}/v2.0/floatingips/{fip_id}"
+        await self._request("DELETE", url, token=token)
+
+    async def list_floating_ips(self, token: str, region: str) -> list[dict[str, Any]]:
+        _, network_base = await self.get_catalog_endpoints(token, region)
+        url = f"{network_base.rstrip('/')}/v2.0/floatingips"
+        data = await self._request("GET", url, token=token)
+        fis = data.get("floatingips") if isinstance(data, dict) else None
+        return [x for x in fis if isinstance(x, dict)] if isinstance(fis, list) else []
 
 
 def is_slctl_rate_limit_error(status: int) -> bool:

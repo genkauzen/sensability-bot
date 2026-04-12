@@ -38,7 +38,7 @@ def _chunk_messages(html: str) -> list[str]:
     return parts
 
 
-def _full_request_html(method: str, path: str, json_body: Any) -> str:
+def _full_request_html(method: str, path: str, json_body: Any, *, service_label: str) -> str:
     lines = [f"{method} {path}", "Authorization: Bearer <скрыто>"]
     if json_body is not None:
         try:
@@ -50,10 +50,12 @@ def _full_request_html(method: str, path: str, json_body: Any) -> str:
     lines.append(raw)
     inner = _truncate("\n".join(lines), _MAX_FULL)
     block = "<blockquote><pre>" + esc(inner) + "</pre></blockquote>"
-    return bold("TWC") + " " + code(f"{method} {path}") + "\n📤 " + bold("Запрос") + "\n" + block
+    return bold(service_label) + " " + code(f"{method} {path}") + "\n📤 " + bold("Запрос") + "\n" + block
 
 
-def _full_response_html(method: str, path: str, status: int, text: str, parsed: Any, ok: bool) -> str:
+def _full_response_html(
+    method: str, path: str, status: int, text: str, parsed: Any, ok: bool, *, service_label: str
+) -> str:
     if parsed is not None and isinstance(parsed, (dict, list)):
         try:
             inner = json.dumps(parsed, ensure_ascii=False, indent=2)
@@ -65,7 +67,7 @@ def _full_response_html(method: str, path: str, status: int, text: str, parsed: 
     block = "<blockquote><pre>" + esc(inner) + "</pre></blockquote>"
     st = "✅" if ok else "❌"
     return (
-        bold("TWC")
+        bold(service_label)
         + " "
         + code(f"{method} {path}")
         + "\n"
@@ -186,11 +188,18 @@ def _mid_response_lines(method: str, path: str, status: int, parsed: Any, ok: bo
     return out
 
 
-def build_request_debug_html(mode: TwcDebugMode, method: str, path: str, json_body: Any) -> list[str]:
+def build_request_debug_html(
+    mode: TwcDebugMode,
+    method: str,
+    path: str,
+    json_body: Any,
+    *,
+    service_label: str = "TWC",
+) -> list[str]:
     if mode == "low":
         return []
     if mode == "full":
-        return _chunk_messages(_full_request_html(method, path, json_body))
+        return _chunk_messages(_full_request_html(method, path, json_body, service_label=service_label))
     lines = _mid_request_lines(method, path, json_body)
     return _chunk_messages("\n".join(lines))
 
@@ -203,10 +212,14 @@ def build_response_debug_html(
     text: str,
     parsed: Any,
     ok: bool,
+    *,
+    service_label: str = "TWC",
 ) -> list[str]:
     if mode == "low":
         return []
     if mode == "full":
-        return _chunk_messages(_full_response_html(method, path, status, text, parsed, ok))
+        return _chunk_messages(
+            _full_response_html(method, path, status, text, parsed, ok, service_label=service_label)
+        )
     lines = _mid_response_lines(method, path, status, parsed, ok, text)
     return _chunk_messages("\n".join(lines))

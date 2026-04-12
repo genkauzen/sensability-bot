@@ -6,7 +6,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from sensability.slctl_constants import DEFAULT_SLCTL_EXTRA_CIDR_URL
+from sensability.slctl_constants import (
+    DEFAULT_SLCTL_EXTRA_CIDR_URL,
+    DEFAULT_SLCTL_FLOAT_REGIONS,
+)
 
 
 def _bool(v: str | None, default: bool = False) -> bool:
@@ -37,6 +40,14 @@ def _csv_ids(v: str | None) -> frozenset[str]:
     if not v or not str(v).strip():
         return frozenset()
     return frozenset(x.strip() for x in str(v).split(",") if x.strip())
+
+
+def _csv_region_list(v: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = (v or "").strip()
+    if not raw:
+        return default
+    parts = tuple(x.strip() for x in raw.split(",") if x.strip())
+    return parts if parts else default
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,9 @@ class Config:
     slctl_image_id: str | None
     slctl_network_uuid: str | None
     slctl_billing_x_token: str | None
+    slctl_float_regions: tuple[str, ...]
+    regru_atmoment_acc: int
+    regru_minimum_rubles: float
     data_dir: Path
     compose_dir: Path
     subnets_path: Path
@@ -146,6 +160,12 @@ def load_config() -> Config:
         slctl_image_id=(os.getenv("SLCTL_IMAGE_ID") or "").strip() or None,
         slctl_network_uuid=(os.getenv("SLCTL_NETWORK_UUID") or "").strip() or None,
         slctl_billing_x_token=(os.getenv("SLCTL_BILLING_X_TOKEN") or "").strip() or None,
+        slctl_float_regions=_csv_region_list(
+            os.getenv("SLCTL_FLOAT_REGIONS"),
+            DEFAULT_SLCTL_FLOAT_REGIONS,
+        ),
+        regru_atmoment_acc=max(1, _int(os.getenv("REGRU_ATMOMENT_ACC"), 4)),
+        regru_minimum_rubles=_float(os.getenv("REGRU_MINIMUM_RUBLES"), 0.0),
         data_dir=data_dir,
         compose_dir=compose,
         subnets_path=subnets,

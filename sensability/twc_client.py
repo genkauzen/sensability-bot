@@ -94,7 +94,7 @@ class TimewebClient:
         dbg = self._debug_ctrl
         if dbg and dbg.mode in ("full", "mid"):
             await self._emit_debug_parts(
-                build_request_debug_html(dbg.mode, method, path, json_body)
+                build_request_debug_html(dbg.mode, method, path, json_body, service_label="Timeweb")
             )
 
         r = await self._client.request(
@@ -112,7 +112,14 @@ class TimewebClient:
         if dbg and dbg.mode in ("full", "mid"):
             await self._emit_debug_parts(
                 build_response_debug_html(
-                    dbg.mode, method, path, r.status_code, text, data, r.is_success
+                    dbg.mode,
+                    method,
+                    path,
+                    r.status_code,
+                    text,
+                    data,
+                    r.is_success,
+                    service_label="Timeweb",
                 )
             )
 
@@ -190,6 +197,34 @@ class TimewebClient:
         return data
 
 
+def timeweb_availability_zone_str(value: Any) -> str:
+    """availability_zone в ответе API может быть строкой (msk-1) или объектом."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for k in ("id", "slug", "code", "name", "availability_zone"):
+            v = value.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if isinstance(v, dict):
+                inner = timeweb_availability_zone_str(v)
+                if inner:
+                    return inner
+    return ""
+
+
+def timeweb_server_zone_label(server: dict[str, Any]) -> str:
+    z = timeweb_availability_zone_str(server.get("availability_zone"))
+    if z:
+        return z
+    loc = server.get("location")
+    if isinstance(loc, str) and loc.strip():
+        return loc.strip()
+    return "—"
+
+
 def floating_ip_record_from_response(data: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
@@ -204,6 +239,15 @@ def extract_ipv4_from_floating_record(fi: dict[str, Any]) -> str | None:
     return None
 
 
+def _timeweb_ip_record_is_ipv6(typ: Any) -> bool:
+    if typ is None:
+        return False
+    if isinstance(typ, int):
+        return typ == 6
+    s = str(typ).lower()
+    return "v6" in s or s == "ipv6" or s == "6"
+
+
 def extract_public_ipv4s(ips_payload: dict[str, Any]) -> list[str]:
     out: list[str] = []
     raw = ips_payload.get("server_ips") or ips_payload.get("ips") or []
@@ -215,6 +259,8 @@ def extract_public_ipv4s(ips_payload: dict[str, Any]) -> list[str]:
         if not isinstance(item, dict):
             continue
         ip = item.get("ip") or item.get("address")
+        if isinstance(ip, dict):
+            ip = ip.get("ip")
         if not ip:
             continue
         s = str(ip).strip()
@@ -223,30 +269,49 @@ def extract_public_ipv4s(ips_payload: dict[str, Any]) -> list[str]:
         except ValueError:
             continue
         if isinstance(a, ipaddress.IPv4Address):
-            typ = (item.get("type") or item.get("family") or "").lower()
-            if "v6" in typ or typ == "ipv6":
+            typ = item.get("type") or item.get("family")
+            if _timeweb_ip_record_is_ipv6(typ):
                 continue
             out.append(s)
     return list(dict.fromkeys(out))
 
 
 def extract_ipv4_from_server(server: dict[str, Any]) -> list[str]:
+    """Публичные IPv4: актуальный API отдаёт сети как networks[].ips[{type, ip, …}]."""
     found: list[str] = []
+
+    def push_ipv4_str(raw: str) -> None:
+        s = raw.strip()
+        if not s:
+            return
+        try:
+            a = ipaddress.ip_address(s)
+        except ValueError:
+            return
+        if isinstance(a, ipaddress.IPv4Address):
+            found.append(str(a))
+
     nets = server.get("networks")
     if isinstance(nets, list):
         for n in nets:
             if not isinstance(n, dict):
                 continue
+            ips_list = n.get("ips")
+            if isinstance(ips_list, list):
+                for it in ips_list:
+                    if not isinstance(it, dict):
+                        continue
+                    if _timeweb_ip_record_is_ipv6(it.get("type")):
+                        continue
+                    ip = it.get("ip") or it.get("address")
+                    if isinstance(ip, dict):
+                        ip = ip.get("ip")
+                    if isinstance(ip, str):
+                        push_ipv4_str(ip)
             for key in ("ip", "floating_ip", "public_ip"):
                 v = n.get(key)
-                if not isinstance(v, str):
-                    continue
-                try:
-                    a = ipaddress.ip_address(v.strip())
-                except ValueError:
-                    continue
-                if isinstance(a, ipaddress.IPv4Address):
-                    found.append(str(a))
+                if isinstance(v, str):
+                    push_ipv4_str(v)
     return list(dict.fromkeys(found))
 
 

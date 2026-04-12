@@ -8,6 +8,7 @@ from typing import Any
 import aiosqlite
 
 from sensability.config import Config
+from sensability.twc_constants import TWC_FLOAT_IP_ZONES, TWC_FLOAT_IP_ZONES_DB_KEY
 
 
 SCHEMA = """
@@ -36,7 +37,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     slctl_keystone_password TEXT,
     slctl_token_issued_ts REAL,
     slctl_billing_x_token TEXT,
-    whitelist_regru TEXT
+    whitelist_regru TEXT,
+    whitelist_slctl_fips TEXT,
+    whitelist_regru_ips TEXT,
+    regru_extra_ip_ok INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS bot_outbox (
@@ -55,6 +59,11 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+
+CREATE TABLE IF NOT EXISTS kv (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
 """
 
 
@@ -85,6 +94,9 @@ class AccountRow:
     slctl_token_issued_ts: float | None
     slctl_billing_x_token: str | None
     whitelist_regru: str | None
+    whitelist_slctl_fips: str | None
+    whitelist_regru_ips: str | None
+    regru_extra_ip_ok: int | None
 
 
 def _row_to_account(r: aiosqlite.Row) -> AccountRow:
@@ -114,7 +126,20 @@ def _row_to_account(r: aiosqlite.Row) -> AccountRow:
         slctl_token_issued_ts=_col(r, "slctl_token_issued_ts"),
         slctl_billing_x_token=_col(r, "slctl_billing_x_token"),
         whitelist_regru=_col(r, "whitelist_regru"),
+        whitelist_slctl_fips=_col(r, "whitelist_slctl_fips"),
+        whitelist_regru_ips=_col(r, "whitelist_regru_ips"),
+        regru_extra_ip_ok=_col_int_nullable(r, "regru_extra_ip_ok"),
     )
+
+
+def _col_int_nullable(r: aiosqlite.Row, key: str) -> int | None:
+    v = _col(r, key)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _col(r: aiosqlite.Row, key: str) -> Any:
@@ -152,6 +177,9 @@ class Database:
             ("slctl_token_issued_ts", "REAL"),
             ("slctl_billing_x_token", "TEXT"),
             ("whitelist_regru", "TEXT"),
+            ("whitelist_slctl_fips", "TEXT"),
+            ("whitelist_regru_ips", "TEXT"),
+            ("regru_extra_ip_ok", "INTEGER"),
         ):
             if col not in have:
                 default = ""
@@ -281,6 +309,9 @@ class Database:
                 "slctl_token_issued_ts",
                 "slctl_billing_x_token",
                 "whitelist_regru",
+                "whitelist_slctl_fips",
+                "whitelist_regru_ips",
+                "regru_extra_ip_ok",
             }
         )
         fields = {k: v for k, v in fields.items() if k in allowed}
@@ -372,6 +403,21 @@ class Database:
         )
         await self._db.commit()
 
+    async def append_whitelist_slctl_fip(self, name: str, fip_id: str) -> None:
+        row = await self.get_account(name)
+        if not row:
+            return
+        try:
+            cur = json.loads(row.whitelist_slctl_fips or "[]")
+        except json.JSONDecodeError:
+            cur = []
+        if not isinstance(cur, list):
+            cur = []
+        sid = str(fip_id).strip()
+        if sid and sid not in cur:
+            cur.append(sid)
+        await self.patch_account(name, {"whitelist_slctl_fips": json.dumps(cur)})
+
     async def append_whitelist_slctl(self, name: str, server_id: str) -> None:
         row = await self.get_account(name)
         if not row:
@@ -400,6 +446,44 @@ class Database:
         if reglet_id not in cur:
             cur.append(reglet_id)
         await self.patch_account(name, {"whitelist_regru": json.dumps(cur)})
+
+    def whitelist_slctl_fip_ids(self, row: AccountRow) -> list[str]:
+        try:
+            raw = json.loads(row.whitelist_slctl_fips or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if x is not None and str(x).strip()]
+
+    async def append_whitelist_regru_ip(self, name: str, ip_row_id: int) -> None:
+        row = await self.get_account(name)
+        if not row:
+            return
+        try:
+            cur = json.loads(row.whitelist_regru_ips or "[]")
+        except json.JSONDecodeError:
+            cur = []
+        if not isinstance(cur, list):
+            cur = []
+        if ip_row_id not in cur:
+            cur.append(ip_row_id)
+        await self.patch_account(name, {"whitelist_regru_ips": json.dumps(cur)})
+
+    def whitelist_regru_ip_ids(self, row: AccountRow) -> list[int]:
+        try:
+            raw = json.loads(row.whitelist_regru_ips or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        out: list[int] = []
+        for x in raw:
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def whitelist_slctl_ids(self, row: AccountRow) -> list[str]:
         try:
@@ -448,6 +532,35 @@ class Database:
             except (TypeError, ValueError):
                 continue
         return out
+
+    async def get_kv(self, key: str) -> str | None:
+        cur = await self._db.execute("SELECT v FROM kv WHERE k=?", (key,))
+        row = await cur.fetchone()
+        return None if row is None else str(row[0])
+
+    async def set_kv(self, key: str, value: str) -> None:
+        await self._db.execute(
+            "INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (key, value),
+        )
+        await self._db.commit()
+
+    async def delete_kv(self, key: str) -> None:
+        await self._db.execute("DELETE FROM kv WHERE k=?", (key,))
+        await self._db.commit()
+
+    async def get_twc_float_ip_zones_for_brute(self) -> tuple[str, ...]:
+        raw = await self.get_kv(TWC_FLOAT_IP_ZONES_DB_KEY)
+        if raw is None or not str(raw).strip():
+            return TWC_FLOAT_IP_ZONES
+        try:
+            arr = json.loads(raw)
+        except json.JSONDecodeError:
+            return TWC_FLOAT_IP_ZONES
+        if not isinstance(arr, list):
+            return TWC_FLOAT_IP_ZONES
+        out = tuple(str(x).strip() for x in arr if str(x).strip())
+        return out if out else TWC_FLOAT_IP_ZONES
 
     async def log_event(self, kind: str, account: str | None, detail: Any) -> None:
         payload = json.dumps(detail, ensure_ascii=False) if not isinstance(detail, str) else detail

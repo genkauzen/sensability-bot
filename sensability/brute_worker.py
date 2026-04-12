@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sensability.account_sync import (
     account_eligible_for_brute,
@@ -15,13 +15,18 @@ from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.ip_pool import ipv4_in_any_potential, ipv4_in_pool
 from sensability.notify import TelegramNotify
-from sensability.regru_client import RegruClient
-from sensability.regru_ops import regru_refresh_whitelist
+from sensability.regru_client import (
+    RegruApiError,
+    RegruClient,
+    regru_ip_record_is_spb_ipv4,
+    regru_is_spb_region,
+)
+from sensability.regru_constants import REGRU_REGION_SPB
+from sensability.regru_ops import regru_pick_spb_plan_and_image, regru_refresh_whitelist
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, code, esc, spoiler_code
 from sensability.twc_constants import (
     TWC_BANDWIDTH,
-    TWC_FLOAT_IP_ZONES,
     TWC_OS_ID,
     TWC_PRESET_ID,
 )
@@ -29,7 +34,6 @@ from sensability.slctl_constants import SLCTL_RATE_COOLDOWN_SEC
 from sensability.slctl_client import (
     SelectelClient,
     SlctlApiError,
-    extract_public_ipv4_from_nova_server,
     is_slctl_rate_limit_error,
     parse_error_message as slctl_parse_error_message,
 )
@@ -44,6 +48,7 @@ from sensability.twc_client import (
     looks_like_daily_limit_error,
     looks_like_month_balance_error,
     parse_error_message,
+    timeweb_server_zone_label,
 )
 
 if TYPE_CHECKING:
@@ -54,6 +59,14 @@ log = logging.getLogger("sensability.brute")
 POLL_INTERVAL = 3.0
 POLL_ATTEMPTS = 45
 NOTFOUND_GIVEUP = 1
+
+LIVE_SVC_TIMEWEB = "Timeweb Cloud"
+LIVE_SVC_REGRU = "Reg.ru CloudVPS"
+LIVE_SVC_SELECTEL = "Selectel Cloud"
+
+
+def _live_line_service(label: str) -> str:
+    return "┈ " + bold("Сервис") + f" {code(label)}"
 
 
 class BruteOrchestrator:
@@ -82,7 +95,8 @@ class BruteOrchestrator:
         self._networks_selectel = networks_selectel
         self._sem_twc = asyncio.Semaphore(cfg.twc_atmoment_acc)
         self._sem_slctl = asyncio.Semaphore(cfg.slctl_atmoment_acc)
-        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._sem_regru = asyncio.Semaphore(cfg.regru_atmoment_acc)
+        self._slctl_float_rr = 0
         self._stop = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
         self._brute_paused = False
@@ -171,7 +185,12 @@ class BruteOrchestrator:
         row0 = await sync_account(self.db, self.twc, self.slctl, self._regru, self.cfg, name)
         if not row0:
             return
-        sem = self._sem_slctl if row0.provider == "selectel" else self._sem_twc
+        if row0.provider == "selectel":
+            sem = self._sem_slctl
+        elif row0.provider == "regru":
+            sem = self._sem_regru
+        else:
+            sem = self._sem_twc
         async with sem:
             if self._brute_paused:
                 return
@@ -232,7 +251,15 @@ class BruteOrchestrator:
             return
         server_id = int(sid)
         root_pass = str(server.get("root_pass") or "")
-        region = str(server.get("availability_zone") or self.cfg.twc_vm_region or "—")
+        last_srv_snap: dict[str, Any] | None = None
+
+        def _twc_vm_region_live() -> str:
+            src = last_srv_snap if last_srv_snap is not None else server
+            z = timeweb_server_zone_label(src)
+            if z != "—":
+                return z
+            cfgz = (self.cfg.twc_vm_region or "").strip()
+            return cfgz if cfgz else "—"
 
         for attempt in range(3):
             try:
@@ -266,6 +293,7 @@ class BruteOrchestrator:
                     srv = await self.twc.get_server(row.api_key, server_id)
                     s = srv.get("server") if isinstance(srv, dict) else None
                     if isinstance(s, dict):
+                        last_srv_snap = s
                         ips = extract_ipv4_from_server(s)
                 for ip in ips:
                     if ip.count(".") == 3:
@@ -296,9 +324,10 @@ class BruteOrchestrator:
                             "\n".join(
                                 [
                                     "🖥 " + bold("Live — облачная ВМ"),
+                                    _live_line_service(LIVE_SVC_TIMEWEB),
                                     "┈ " + bold("Аккаунт") + f" {code(name)}",
                                     "┈ " + bold("ВМ") + f" {code(vm_name)}",
-                                    "┈ " + bold("Регион") + f" {code(region)}",
+                                    "┈ " + bold("Регион") + f" {code(_twc_vm_region_live())}",
                                     "┈ " + bold("IPv4") + f" {code('— (ВМ удалена вручную)')}",
                                 ]
                             )
@@ -323,9 +352,10 @@ class BruteOrchestrator:
 
         live_vm = [
             "🖥 " + bold("Live — облачная ВМ"),
+            _live_line_service(LIVE_SVC_TIMEWEB),
             "┈ " + bold("Аккаунт") + f" {code(name)}",
             "┈ " + bold("ВМ") + f" {code(vm_name)}",
-            "┈ " + bold("Регион") + f" {code(region)}",
+            "┈ " + bold("Регион") + f" {code(_twc_vm_region_live())}",
             "┈ " + bold("IPv4") + f" {code(pub_ip or '—')}",
         ]
         live_vm.extend(self._ip_live_extra_lines(pub_ip))
@@ -390,9 +420,10 @@ class BruteOrchestrator:
         if self.cfg.full_logs:
             await self.notify.logs(f"{bold('TWC')} плавающий IP · {esc(name)} (баланс выше порога)")
 
+        zones = await self.db.get_twc_float_ip_zones_for_brute()
         data: dict | None = None
         zone_used = ""
-        for zone in TWC_FLOAT_IP_ZONES:
+        for zone in zones:
             body = {"is_ddos_guard": False, "availability_zone": zone}
             try:
                 data = await self.twc.create_floating_ip(row.api_key, body)
@@ -432,7 +463,7 @@ class BruteOrchestrator:
 
         if not data:
             await self.stats.add_vm_fail()
-            await self.db.log_event("float_ip_create_fail", name, {"zones": list(TWC_FLOAT_IP_ZONES)})
+            await self.db.log_event("float_ip_create_fail", name, {"zones": list(zones)})
             return
 
         await self.stats.add_float_ok()
@@ -482,6 +513,7 @@ class BruteOrchestrator:
                             "\n".join(
                                 [
                                     "📡 " + bold("Live — плавающий IPv4"),
+                                    _live_line_service(LIVE_SVC_TIMEWEB),
                                     "┈ " + bold("Аккаунт") + f" {code(name)}",
                                     "┈ " + bold("Зона") + f" {code(zone_used)}",
                                     "┈ " + bold("IPv4-Address") + f" {code('— (ресурс удалён)')}",
@@ -502,6 +534,7 @@ class BruteOrchestrator:
 
         live_f = [
             "📡 " + bold("Live — плавающий публичный IPv4"),
+            _live_line_service(LIVE_SVC_TIMEWEB),
             "┈ " + bold("Аккаунт") + f" {code(name)}",
             "┈ " + bold("Зона доступности") + f" {code(zone_used)}",
             "┈ " + bold("📡IPv4-Address:") + f" {code(pub_ip or '—')}",
@@ -566,33 +599,284 @@ class BruteOrchestrator:
                 {"ip": pub_ip, "floating_ip_id": fid},
             )
 
+    def _next_slctl_float_region(self) -> str:
+        regions = self.cfg.slctl_float_regions
+        if not regions:
+            regions = ("ru-7",)
+        reg = regions[self._slctl_float_rr % len(regions)]
+        self._slctl_float_rr += 1
+        return reg
+
     async def _run_brute_regru(self, name: str, row: AccountRow) -> None:
         await self.stats.track_account(name, row.balance_cached)
-        await regru_refresh_whitelist(
-            self.db, self._regru, self.cfg, name, row, delete_bot_vms=True
-        )
+        await regru_refresh_whitelist(self.db, self._regru, self.cfg, name, row, delete_bot_vms=True)
+        row2 = await self.db.get_account(name)
+        if not row2:
+            return
+        if row2.regru_extra_ip_ok != 0:
+            anchor = await self._regru_spb_anchor_reglet_id(row2)
+            if anchor is not None:
+                if await self._regru_brute_extra_ip_once(name, row2, anchor):
+                    return
+        await self._regru_brute_vm_once(name, row2)
+
+    async def _regru_spb_anchor_reglet_id(self, row: AccountRow) -> int | None:
+        try:
+            reglets = await self._regru.list_reglets(row.api_key)
+        except Exception:
+            return None
+        for raw in reglets:
+            if not isinstance(raw, dict) or not regru_is_spb_region(raw):
+                continue
+            st = str(raw.get("status") or "").lower()
+            if st in ("destroyed", "deleted", "archived", "removed"):
+                continue
+            try:
+                return int(raw.get("id"))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def _regru_brute_extra_ip_once(
+        self, name: str, row: AccountRow, anchor_id: int
+    ) -> bool:
+        """True — цикл «доп. IP» отработан (в т.ч. 403 → только ВМ дальше), не вызывать ВМ в этом же проходе."""
+        tok = row.api_key
+        before: set[int] = set()
+        try:
+            for rec in await self._regru.list_ips(tok, reglet_id=anchor_id):
+                if isinstance(rec, dict) and rec.get("id") is not None:
+                    try:
+                        before.add(int(rec["id"]))
+                    except (TypeError, ValueError):
+                        pass
+        except RegruApiError as e:
+            if e.status in (401, 403):
+                await self.db.patch_account(name, {"regru_extra_ip_ok": 0})
+                return True
+            if self.cfg.full_logs:
+                await self.notify.logs(f"{bold('Reg.ru list_ips')} {esc(name)}: {esc(str(e)[:300])}")
+            return True
+        except Exception:
+            return True
+
+        try:
+            await self._regru.order_extra_ips(tok, anchor_id, ipv4_count=1)
+        except RegruApiError as e:
+            if e.status in (401, 403, 402):
+                await self.db.patch_account(name, {"regru_extra_ip_ok": 0})
+                return True
+            if self.cfg.full_logs:
+                await self.notify.logs(
+                    f"{bold('Reg.ru заказ IP')} {esc(name)}: {esc(str(e)[:400])}"
+                )
+            return True
+        except Exception:
+            return True
+
+        await self.db.patch_account(name, {"regru_extra_ip_ok": 1})
+
+        new_id: int | None = None
+        new_ip: str | None = None
+        for attempt in range(POLL_ATTEMPTS):
+            if self._stop.is_set() or self._brute_paused:
+                break
+            if attempt:
+                await asyncio.sleep(POLL_INTERVAL)
+            await self.stats.add_ipv4_check()
+            try:
+                for rec in await self._regru.list_ips(tok, reglet_id=anchor_id):
+                    if not isinstance(rec, dict):
+                        continue
+                    try:
+                        iid = int(rec["id"])
+                    except (TypeError, ValueError):
+                        continue
+                    if iid in before:
+                        continue
+                    if str(rec.get("type") or "").lower() != "ipv4":
+                        continue
+                    ip_s = str(rec.get("ip") or "").strip()
+                    if ip_s and ip_s.count(".") == 3:
+                        new_id, new_ip = iid, ip_s
+                        break
+                if new_ip:
+                    break
+            except RegruApiError as ex:
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Reg.ru poll ips')} {esc(str(ex)[:200])}")
+            except Exception:
+                pass
+
+        live_r = [
+            "📡 " + bold("Live — Reg.ru доп. IPv4 (СПб)"),
+            _live_line_service(LIVE_SVC_REGRU),
+            "┈ " + bold("Аккаунт") + f" {code(name)}",
+            "┈ " + bold("Реглет") + f" {code(str(anchor_id))}",
+            "┈ " + bold("IPv4") + f" {code(new_ip or '—')}",
+        ]
+        live_r.extend(self._ip_live_extra_lines(new_ip))
+        await self.notify.live("\n".join(live_r))
+
+        if not new_ip or new_id is None:
+            return True
+
+        if ipv4_in_pool(new_ip, self._networks):
+            await self.stats.add_pool_hit()
+            await self.db.patch_account(name, {"brute_enabled": 0})
+            await self.db.append_whitelist_regru_ip(name, new_id)
+            await self.db.log_event(
+                "pool_hit_regru_ip", name, {"ip": new_ip, "ip_row_id": new_id}
+            )
+            msg = "\n".join(
+                [
+                    "🎯 " + bold("Попадание в ПНА"),
+                    "📡 " + bold("Reg.ru") + " доп. IPv4 (СПб)",
+                    "┈ " + bold("Аккаунт") + f" {code(name)}",
+                    "┈ " + bold("IPv4") + f" {code(new_ip)}",
+                    "┈ " + bold("Запись IP id") + f" {code(str(new_id))} — в белом списке",
+                ]
+            )
+            await self.notify.totalresult(msg)
+            asyncio.create_task(
+                self._delete_regru_ip_later(tok, new_id, new_ip, name),
+                name=f"regru-ip-{new_id}",
+            )
+        else:
+            await self.stats.add_vm_deleted_no_pool()
+            try:
+                await self._regru.delete_ip(tok, str(new_id))
+            except RegruApiError as ex:
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Reg.ru delete_ip')} {esc(str(ex)[:300])}")
+            except Exception:
+                pass
+            await self.db.log_event(
+                "regru_ip_not_in_pool", name, {"ip": new_ip, "ip_row_id": new_id}
+            )
+        return True
+
+    async def _regru_brute_vm_once(self, name: str, row: AccountRow) -> None:
+        picked = await regru_pick_spb_plan_and_image(self._regru, row.api_key)
+        if not picked:
+            await self.stats.add_vm_fail()
+            await self.db.log_event(
+                "regru_no_plan_image", name, {"region": REGRU_REGION_SPB}
+            )
+            return
+        size_slug, image_slug = picked
+        vm_name = f"{self.cfg.twc_vm_name}-regru-{row.name}-{uuid.uuid4().hex[:8]}"
+        if self.cfg.full_logs:
+            await self.notify.logs(
+                f"{bold('Reg.ru')} <code>POST /v1/reglets</code> {code(REGRU_REGION_SPB)} · {esc(name)}"
+            )
+        try:
+            reglet = await self._regru.create_reglet(
+                row.api_key,
+                name=vm_name,
+                size_slug=size_slug,
+                image_slug=image_slug,
+            )
+        except RegruApiError as e:
+            if self.cfg.full_logs:
+                await self.notify.logs(
+                    f"{bold('Reg.ru ошибка')} {e.status}: {esc(e.body[:800])}"
+                )
+            await self.stats.add_vm_fail()
+            await self.db.log_event(
+                "regru_create_fail", name, {"status": e.status, "msg": e.body[:2000]}
+            )
+            return
+
+        await self.stats.add_vm_ok()
+        try:
+            rid = int(reglet.get("id") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        if not rid:
+            await self.stats.add_vm_fail()
+            return
+
+        pub_ip: str | None = None
+        for attempt in range(POLL_ATTEMPTS):
+            if self._stop.is_set() or self._brute_paused:
+                break
+            if attempt:
+                await asyncio.sleep(POLL_INTERVAL)
+            await self.stats.add_ipv4_check()
+            try:
+                r = await self._regru.get_reglet(row.api_key, rid)
+                ip = str(r.get("ip") or "").strip()
+                if ip and ip.count(".") == 3:
+                    pub_ip = ip
+                    break
+            except RegruApiError as ex:
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Reg.ru poll reglet')} {esc(str(ex)[:200])}")
+            except Exception as ex:
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Reg.ru poll')} {esc(str(ex)[:200])}")
+
+        live_v = [
+            "🖥 " + bold("Live — Reg.ru CloudVPS (СПб)"),
+            _live_line_service(LIVE_SVC_REGRU),
+            "┈ " + bold("Аккаунт") + f" {code(name)}",
+            "┈ " + bold("Регион") + f" {code(REGRU_REGION_SPB)}",
+            "┈ " + bold("IPv4") + f" {code(pub_ip or '—')}",
+        ]
+        live_v.extend(self._ip_live_extra_lines(pub_ip))
+        await self.notify.live("\n".join(live_v))
+
+        if not pub_ip:
+            try:
+                await self._regru.delete_reglet(row.api_key, rid)
+            except Exception:
+                pass
+            await self.db.log_event("regru_no_ipv4", name, {"reglet_id": rid})
+            return
+
+        if ipv4_in_pool(pub_ip, self._networks):
+            await self.stats.add_pool_hit()
+            await self.db.patch_account(name, {"brute_enabled": 0})
+            await self.db.append_whitelist_regru(name, rid)
+            await self.db.log_event("pool_hit_regru", name, {"ip": pub_ip, "reglet_id": rid})
+            msg = "\n".join(
+                [
+                    "🎯 " + bold("Попадание в ПНА"),
+                    "🖥 " + bold("Reg.ru") + f" {code(REGRU_REGION_SPB)}",
+                    "┈ " + bold("Аккаунт") + f" {code(name)}",
+                    "┈ " + bold("IPv4") + f" {code(pub_ip)}",
+                    "┈ " + bold("Reglet id") + f" {code(str(rid))} — в белом списке",
+                ]
+            )
+            await self.notify.totalresult(msg)
+            asyncio.create_task(
+                self._delete_regru_reglet_later(row.api_key, rid, name),
+                name=f"regru-vm-{rid}",
+            )
+        else:
+            await self.stats.add_vm_deleted_no_pool()
+            try:
+                await self._regru.delete_reglet(row.api_key, rid)
+            except RegruApiError as ex:
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Reg.ru delete reglet')} {esc(str(ex)[:300])}")
+            except Exception:
+                pass
+            await self.db.log_event("regru_ip_not_in_pool", name, {"ip": pub_ip, "reglet_id": rid})
 
     async def _run_brute_selectel(self, name: str, row: AccountRow) -> None:
         await self.stats.track_account(name, row.balance_cached)
-        reg = self.cfg.slctl_ip_location.strip()
-        vm_name = f"{self.cfg.twc_vm_name}-slctl-{row.name}-{uuid.uuid4().hex[:8]}"
-        flavor = self.cfg.slctl_flavor_id
-        image = self.cfg.slctl_image_id
-        net_uuid = self.cfg.slctl_network_uuid
-
+        reg = self._next_slctl_float_region()
         if self.cfg.full_logs:
             await self.notify.logs(
-                f"{bold('Selectel')} <code>Nova POST /servers</code> · {esc(name)} · {code(reg)}"
+                f"{bold('Selectel')} <code>Neutron POST /floatingips</code> · {esc(name)} · {code(reg)}"
             )
-
         try:
-            data = await self.slctl.create_server(
+            fi = await self.slctl.create_floating_ip(
                 row.api_key,
                 reg,
-                vm_name,
-                flavor_ref=flavor,
-                image_ref=image,
-                network_uuid=net_uuid,
+                description=f"sensability-{name}"[:240],
             )
         except SlctlApiError as e:
             msg = slctl_parse_error_message(e)
@@ -606,29 +890,35 @@ class BruteOrchestrator:
                 await self.db.log_event("slctl_rate_limit", name, {"status": e.status, "msg": msg[:2000]})
                 return
             await self.stats.add_vm_fail()
-            await self.db.log_event("slctl_create_fail", name, {"status": e.status, "msg": msg[:2000]})
+            await self.db.log_event(
+                "slctl_fip_create_fail", name, {"status": e.status, "msg": msg[:2000], "region": reg}
+            )
             return
 
         await self.stats.add_vm_ok()
-        srv_wrap = data.get("server") if isinstance(data, dict) else None
-        if not isinstance(srv_wrap, dict):
-            await self.stats.add_vm_fail()
-            return
-        sid = str(srv_wrap.get("id") or "").strip()
-        if not sid:
+        fid = str(fi.get("id") or "").strip()
+        if not fid:
             await self.stats.add_vm_fail()
             return
 
-        pub_ip: str | None = None
+        pub_ip = str(fi.get("floating_ip_address") or "").strip()
+        if pub_ip and pub_ip.count(".") != 3:
+            pub_ip = None
+
         notfound_streak = 0
         for _ in range(POLL_ATTEMPTS):
             if self._stop.is_set() or self._brute_paused:
                 break
+            if pub_ip:
+                break
             await asyncio.sleep(POLL_INTERVAL)
             await self.stats.add_ipv4_check()
             try:
-                s = await self.slctl.get_server(row.api_key, reg, sid)
-                pub_ip = extract_public_ipv4_from_nova_server(s)
+                fi2 = await self.slctl.get_floating_ip(row.api_key, reg, fid)
+                ip = str(fi2.get("floating_ip_address") or "").strip()
+                if ip and ip.count(".") == 3:
+                    pub_ip = ip
+                    break
             except SlctlApiError as ex:
                 msg = slctl_parse_error_message(ex)
                 if is_slctl_rate_limit_error(ex.status):
@@ -638,25 +928,24 @@ class BruteOrchestrator:
                     )
                     await self.db.log_event("slctl_rate_limit_poll", name, {"msg": msg[:800]})
                     try:
-                        await self.slctl.delete_server(row.api_key, reg, sid)
+                        await self.slctl.delete_floating_ip(row.api_key, reg, fid)
                     except Exception:
                         pass
                     return
                 if ex.status == 404:
                     notfound_streak += 1
                     if notfound_streak >= NOTFOUND_GIVEUP:
-                        await self.db.log_event("slctl_server_gone", name, {"server_id": sid})
+                        await self.db.log_event("slctl_fip_gone", name, {"fip_id": fid})
                         return
                 elif self.cfg.full_logs:
-                    await self.notify.logs(f"{bold('poll nova')} {esc(name)}: {esc(str(ex)[:200])}")
+                    await self.notify.logs(f"{bold('poll fip')} {esc(name)}: {esc(str(ex)[:200])}")
             except Exception as ex:
                 if self.cfg.full_logs:
-                    await self.notify.logs(f"{bold('poll nova')} {esc(name)}: {esc(str(ex)[:200])}")
-            if pub_ip:
-                break
+                    await self.notify.logs(f"{bold('poll fip')} {esc(name)}: {esc(str(ex)[:200])}")
 
         live_s = [
-            "🖥 " + bold("Live — Selectel Nova"),
+            "📡 " + bold("Live — Selectel плавающий IPv4"),
+            _live_line_service(LIVE_SVC_SELECTEL),
             "┈ " + bold("Аккаунт") + f" {code(name)}",
             "┈ " + bold("Регион") + f" {code(reg)}",
             "┈ " + bold("IPv4") + f" {code(pub_ip or '—')}",
@@ -668,44 +957,124 @@ class BruteOrchestrator:
             if notfound_streak >= NOTFOUND_GIVEUP:
                 return
             try:
-                await self.slctl.delete_server(row.api_key, reg, sid)
+                await self.slctl.delete_floating_ip(row.api_key, reg, fid)
             except SlctlApiError as ex:
-                if ex.status != 404:
-                    await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
+                if ex.status != 404 and self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Удаление FIP')}: {esc(str(ex)[:300])}")
             except Exception as ex:
-                await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
-            await self.db.log_event("slctl_no_ipv4", name, {"server_id": sid})
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Удаление FIP')}: {esc(str(ex)[:300])}")
+            await self.db.log_event("slctl_fip_no_addr", name, {"fip_id": fid, "region": reg})
             return
 
         if ipv4_in_pool(pub_ip, self._networks_selectel):
             await self.stats.add_pool_hit()
             await self.db.patch_account(name, {"brute_enabled": 0})
-            await self.db.append_whitelist_slctl(name, sid)
-            await self.db.log_event("pool_hit_slctl", name, {"ip": pub_ip, "server_id": sid})
+            await self.db.append_whitelist_slctl_fip(name, fid)
+            await self.db.log_event(
+                "pool_hit_slctl_fip", name, {"ip": pub_ip, "fip_id": fid, "region": reg}
+            )
             msg = "\n".join(
                 [
                     "🎯 " + bold("Попадание в ПНА"),
-                    "🖥 " + bold("Режим") + " Selectel Nova",
+                    "📡 " + bold("Selectel Neutron") + " плавающий IPv4",
                     "┈ " + bold("Аккаунт") + f" {code(name)}",
                     "┈ " + bold("Публичный IPv4") + f" {code(pub_ip)}",
-                    "┈ " + bold("Сервер id") + f" {code(sid)} — в белом списке",
+                    "┈ " + bold("FIP id") + f" {code(fid)} · регион {code(reg)}",
                 ]
             )
             await self.notify.totalresult(msg)
             asyncio.create_task(
-                self._delete_slctl_later(row.api_key, reg, sid, name),
-                name=f"slctl-del-{sid[:8]}",
+                self._delete_slctl_fip_later(row.api_key, reg, fid, name),
+                name=f"slctl-fip-{fid[:8]}",
             )
         else:
             await self.stats.add_vm_deleted_no_pool()
             try:
-                await self.slctl.delete_server(row.api_key, reg, sid)
+                await self.slctl.delete_floating_ip(row.api_key, reg, fid)
             except SlctlApiError as ex:
-                if ex.status != 404:
-                    await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
+                if ex.status != 404 and self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Удаление FIP')}: {esc(str(ex)[:300])}")
             except Exception as ex:
-                await self.notify.logs(f"{bold('Удаление Nova')} {esc(str(ex)[:300])}")
-            await self.db.log_event("slctl_ip_not_in_pool", name, {"ip": pub_ip, "server_id": sid})
+                if self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('Удаление FIP')}: {esc(str(ex)[:300])}")
+            await self.db.log_event(
+                "slctl_fip_not_in_pool", name, {"ip": pub_ip, "fip_id": fid, "region": reg}
+            )
+
+    async def _delete_slctl_fip_later(
+        self, api_key: str, region: str, fip_id: str, acc_name: str
+    ) -> None:
+        delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
+        await asyncio.sleep(delay)
+        row = await self.db.get_account(acc_name)
+        if row and fip_id in self.db.whitelist_slctl_fip_ids(row):
+            await self.notify.logs(
+                "🔒 "
+                + bold("Selectel FIP в белом списке")
+                + f" {code(fip_id)} — удаление по таймеру отменено."
+            )
+            return
+        try:
+            await self.slctl.delete_floating_ip(api_key, region, fip_id)
+            await self.notify.logs(
+                "\n".join(
+                    [
+                        "⏱ " + bold("Selectel FIP удалён по таймеру"),
+                        f"Аккаунт: {code(acc_name)}",
+                        f"id: {code(fip_id)} · {code(region)}",
+                    ]
+                )
+            )
+            await self.db.log_event("slctl_fip_deleted_timer", acc_name, {"fip_id": fip_id})
+        except SlctlApiError as ex:
+            if ex.status == 404:
+                return
+            await self.notify.logs(f"{bold('Удаление FIP')}: {esc(str(ex)[:400])}")
+        except Exception as ex:
+            await self.notify.logs(f"{bold('Удаление FIP')}: {esc(str(ex)[:400])}")
+
+    async def _delete_regru_ip_later(
+        self, token: str, ip_row_id: int, ip_str: str, acc_name: str
+    ) -> None:
+        delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
+        await asyncio.sleep(delay)
+        row = await self.db.get_account(acc_name)
+        if row and ip_row_id in self.db.whitelist_regru_ip_ids(row):
+            await self.notify.logs(
+                "🔒 "
+                + bold("Reg.ru IP в белом списке")
+                + f" {code(str(ip_row_id))} — удаление по таймеру отменено."
+            )
+            return
+        for ident in (str(ip_row_id), ip_str):
+            try:
+                await self._regru.delete_ip(token, ident)
+                await self.db.log_event(
+                    "regru_ip_deleted_timer", acc_name, {"ip_row_id": ip_row_id}
+                )
+                return
+            except RegruApiError:
+                continue
+            except Exception:
+                continue
+
+    async def _delete_regru_reglet_later(self, token: str, reglet_id: int, acc_name: str) -> None:
+        delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
+        await asyncio.sleep(delay)
+        row = await self.db.get_account(acc_name)
+        if row and reglet_id in self.db.whitelist_regru_ids(row):
+            await self.notify.logs(
+                "🔒 "
+                + bold("Reg.ru reglet в белом списке")
+                + f" {code(str(reglet_id))} — удаление по таймеру отменено."
+            )
+            return
+        try:
+            await self._regru.delete_reglet(token, reglet_id)
+            await self.db.log_event("regru_deleted_timer", acc_name, {"reglet_id": reglet_id})
+        except Exception:
+            pass
 
     async def _delete_slctl_later(self, api_key: str, region: str, server_id: str, acc_name: str) -> None:
         delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
@@ -791,19 +1160,6 @@ class BruteOrchestrator:
         except Exception as ex:
             await self.notify.logs(f"{bold('Ошибка выключения ВМ')}: {esc(str(ex)[:400])}")
 
-    async def _account_loop(self, name: str) -> None:
-        while not self._stop.is_set():
-            while self._brute_paused and not self._stop.is_set():
-                await asyncio.sleep(1.0)
-            try:
-                await self.run_once_account(name)
-            except asyncio.CancelledError:
-                raise
-            except Exception as ex:
-                log.exception("account loop %s", name)
-                await self.notify.logs(f"{bold('Worker')} {code(name)}: {esc(str(ex)[:500])}")
-            await asyncio.sleep(3.0)
-
     async def _supervisor(self) -> None:
         sync_every = max(60, self.cfg.db_sync_time_minutes * 60)
         last_sync = 0.0
@@ -818,15 +1174,15 @@ class BruteOrchestrator:
                         )
                     except Exception:
                         log.exception("sync %s", acc.name)
-            want = {a.name for a in await self.db.list_brute_accounts()}
-            for n in want:
-                if n not in self._tasks or self._tasks[n].done():
-                    self._tasks[n] = asyncio.create_task(self._account_loop(n), name=f"brute-{n}")
-            for n in list(self._tasks):
-                if n not in want:
-                    self._tasks[n].cancel()
-                    del self._tasks[n]
-            await asyncio.sleep(5.0)
+            while self._brute_paused and not self._stop.is_set():
+                await asyncio.sleep(1.0)
+            accs = await self.db.list_brute_accounts()
+            if accs and not self._stop.is_set():
+                await asyncio.gather(
+                    *[self.run_once_account(a.name) for a in accs],
+                    return_exceptions=True,
+                )
+            await asyncio.sleep(3.0)
 
     def start(self) -> None:
         if self._supervisor_task is None or self._supervisor_task.done():
@@ -835,9 +1191,6 @@ class BruteOrchestrator:
 
     async def stop(self) -> None:
         self._stop.set()
-        for t in self._tasks.values():
-            t.cancel()
-        self._tasks.clear()
         if self._supervisor_task:
             self._supervisor_task.cancel()
             try:
