@@ -11,3 +11,6 @@ DEFAULT_SLCTL_EXTRA_CIDR_URL = (
     "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/"
     "refs/heads/main/cidrwhitelist.txt"
 )
+
+# Если Nova не отдаёт список flavor (пустой ответ и т.п.) — типичный минимальный flavor в публичном облаке Selectel (см. доку Terraform / KB).
+DEFAULT_SLCTL_FLAVOR_FALLBACK = "1311"

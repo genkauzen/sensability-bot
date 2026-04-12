@@ -15,6 +15,8 @@ from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.ip_pool import ipv4_in_any_potential, ipv4_in_pool
 from sensability.notify import TelegramNotify
+from sensability.regru_client import RegruClient
+from sensability.regru_ops import regru_refresh_whitelist
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, code, esc, spoiler_code
 from sensability.twc_constants import (
@@ -61,6 +63,7 @@ class BruteOrchestrator:
         db: Database,
         twc: TimewebClient,
         slctl: SelectelClient,
+        regru: RegruClient,
         stats: StatsCollector,
         notify: TelegramNotify,
         networks: tuple,
@@ -71,6 +74,7 @@ class BruteOrchestrator:
         self.db = db
         self.twc = twc
         self.slctl = slctl
+        self._regru = regru
         self.stats = stats
         self.notify = notify
         self._networks = networks
@@ -164,14 +168,14 @@ class BruteOrchestrator:
     async def run_once_account(self, name: str) -> None:
         if self._brute_paused:
             return
-        row0 = await sync_account(self.db, self.twc, self.slctl, self.cfg, name)
+        row0 = await sync_account(self.db, self.twc, self.slctl, self._regru, self.cfg, name)
         if not row0:
             return
         sem = self._sem_slctl if row0.provider == "selectel" else self._sem_twc
         async with sem:
             if self._brute_paused:
                 return
-            row = await sync_account(self.db, self.twc, self.slctl, self.cfg, name)
+            row = await sync_account(self.db, self.twc, self.slctl, self._regru, self.cfg, name)
             if not row:
                 return
             if not account_eligible_for_brute(row, self.cfg):
@@ -179,6 +183,8 @@ class BruteOrchestrator:
 
             if row.provider == "selectel":
                 await self._run_brute_selectel(name, row)
+            elif row.provider == "regru":
+                await self._run_brute_regru(name, row)
             elif account_prefers_floating_ip_probe(row):
                 await self._run_brute_floating_ip(name, row)
             else:
@@ -560,6 +566,12 @@ class BruteOrchestrator:
                 {"ip": pub_ip, "floating_ip_id": fid},
             )
 
+    async def _run_brute_regru(self, name: str, row: AccountRow) -> None:
+        await self.stats.track_account(name, row.balance_cached)
+        await regru_refresh_whitelist(
+            self.db, self._regru, self.cfg, name, row, delete_bot_vms=True
+        )
+
     async def _run_brute_selectel(self, name: str, row: AccountRow) -> None:
         await self.stats.track_account(name, row.balance_cached)
         reg = self.cfg.slctl_ip_location.strip()
@@ -801,7 +813,9 @@ class BruteOrchestrator:
                 last_sync = now
                 for acc in await self.db.list_accounts():
                     try:
-                        await sync_account(self.db, self.twc, self.slctl, self.cfg, acc.name)
+                        await sync_account(
+                            self.db, self.twc, self.slctl, self._regru, self.cfg, acc.name
+                        )
                     except Exception:
                         log.exception("sync %s", acc.name)
             want = {a.name for a in await self.db.list_brute_accounts()}

@@ -19,6 +19,7 @@ from sensability.ip_pool import (
     load_potential_networks,
     merge_ipv4_networks,
 )
+from sensability.regru_client import RegruClient
 from sensability.slctl_client import SelectelClient
 from sensability.notify import TelegramNotify
 from sensability.stats import StatsCollector
@@ -44,11 +45,13 @@ async def post_shutdown(application: Application) -> None:
     orch: BruteOrchestrator = application.bot_data["orchestrator"]
     twc: TimewebClient = application.bot_data["twc"]
     slctl: SelectelClient = application.bot_data["slctl"]
+    regru: RegruClient = application.bot_data["regru"]
     db: Database = application.bot_data["db"]
     notify: TelegramNotify = application.bot_data["notify"]
     await orch.stop()
     await twc.aclose()
     await slctl.aclose()
+    await regru.aclose()
     await db.close()
     try:
         await notify.logs("⏹ " + bold("Sensability остановлен"))
@@ -93,7 +96,7 @@ def main() -> None:
     twc_debug = TwcApiDebugController()
     db = Database(db_path(cfg))
     stats = StatsCollector()
-    notify = TelegramNotify(application.bot, cfg)
+    notify = TelegramNotify(application.bot, cfg, db)
 
     async def twc_debug_emit(html: str) -> None:
         tid = cfg.topic_terminal
@@ -114,9 +117,10 @@ def main() -> None:
 
     slctl_proxy = cfg.slctl_proxy_url if cfg.slctl_proxy_use and cfg.slctl_proxy_url else None
     slctl = SelectelClient(slctl_proxy)
+    regru = RegruClient(twc_proxy)
 
     orchestrator = BruteOrchestrator(
-        cfg, db, twc, slctl, stats, notify, nets, pot, nets_selectel
+        cfg, db, twc, slctl, regru, stats, notify, nets, pot, nets_selectel
     )
 
     tz = os.getenv("TZ", "Europe/Moscow")
@@ -125,6 +129,7 @@ def main() -> None:
         db=db,
         twc=twc,
         slctl=slctl,
+        regru=regru,
         twc_debug=twc_debug,
         stats=stats,
         notify=notify,

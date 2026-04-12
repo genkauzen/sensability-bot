@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from sensability.slctl_constants import DEFAULT_SLCTL_FLAVOR_FALLBACK
+
 IDENTITY_URL_DEFAULT = "https://cloud.api.selcloud.ru/identity/v3"
 BILLING_BASE_DEFAULT = "https://api.selectel.ru"
 
@@ -41,14 +43,32 @@ def _looks_like_money_balance_type(balance_type: str) -> bool:
         "money",
         "prepaid",
         "account",
-        "bonus",
-        "бонус",
         "основ",
         "generic",
         "total",
         "баланс",
     )
     return any(k in x for k in keys)
+
+
+def _normalize_selectel_rub_amount(amount: float, currency: str | None) -> float:
+    """Биллинг иногда отдаёт копейки целым числом (100 ₽ → 10000). Порог 10000, чтобы не трогать суммы вроде 1500 ₽."""
+    cur = str(currency or "RUB").strip().upper()
+    if cur in ("RUR", "₽", ""):
+        cur = "RUB"
+    if cur != "RUB":
+        return amount
+    try:
+        if amount >= 10000 and abs(amount - round(amount)) < 1e-6:
+            return round(amount / 100.0, 2)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return amount
+
+
+def _looks_like_bonus_balance_type(balance_type: str) -> bool:
+    x = str(balance_type or "").strip().lower()
+    return "bonus" in x or "бонус" in x or "promo" in x
 
 
 def parse_v3_balances_payload(payload: dict[str, Any]) -> tuple[float | None, str | None]:
@@ -69,13 +89,18 @@ def parse_v3_balances_payload(payload: dict[str, Any]) -> tuple[float | None, st
     for b in billings:
         if not isinstance(b, dict):
             continue
+        # final_sum и balances_values_sum в одном блоке часто дублируют сумму — берём одно поле.
+        block_total: float | None = None
         for key in ("final_sum", "balances_values_sum"):
             if b.get(key) is None:
                 continue
             try:
-                final_chunks.append(float(b[key]))
+                block_total = float(b[key])
+                break
             except (TypeError, ValueError):
                 pass
+        if block_total is not None:
+            final_chunks.append(block_total)
         bals = b.get("balances")
         if not isinstance(bals, list):
             continue
@@ -90,25 +115,29 @@ def parse_v3_balances_payload(payload: dict[str, Any]) -> tuple[float | None, st
             except (TypeError, ValueError):
                 continue
             bt = str(bal.get("balance_type") or "")
+            if _looks_like_bonus_balance_type(bt):
+                continue
             if _looks_like_money_balance_type(bt):
                 typed_lines.append(v)
             else:
                 fallback_lines.append(v)
 
     if final_chunks:
-        s = sum(final_chunks)
+        s = _normalize_selectel_rub_amount(sum(final_chunks), currency)
         if s != 0:
             return s, currency
         if typed_lines and any(x != 0 for x in typed_lines):
-            return sum(typed_lines), currency
+            return _normalize_selectel_rub_amount(sum(typed_lines), currency), currency
         if fallback_lines and any(x != 0 for x in fallback_lines):
-            return sum(fallback_lines), currency
+            return _normalize_selectel_rub_amount(sum(fallback_lines), currency), currency
         return s, currency
 
     if typed_lines:
-        return sum(typed_lines), currency
+        s = sum(typed_lines)
+        return _normalize_selectel_rub_amount(s, currency), currency
     if fallback_lines:
-        return sum(fallback_lines), currency
+        s = sum(fallback_lines)
+        return _normalize_selectel_rub_amount(s, currency), currency
     return None, None
 
 
@@ -204,6 +233,7 @@ class SelectelClient:
             follow_redirects=True,
         )
         self._endpoint_cache: dict[tuple[str, str], tuple[str, str]] = {}
+        self._image_endpoint_cache: dict[tuple[str, str], str | None] = {}
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -278,6 +308,7 @@ class SelectelClient:
                     parsed = None
             if r.status_code in (200, 201) and token:
                 self._endpoint_cache.clear()
+                self._image_endpoint_cache.clear()
                 return str(token).strip()
             last_exc = SlctlApiError(r.status_code, r.text[:1500], parsed)
             if r.status_code != 401:
@@ -320,6 +351,19 @@ class SelectelClient:
             network = f"https://{region}.cloud.api.selcloud.ru"
         self._endpoint_cache[k] = (compute, network)
         return compute, network
+
+    async def get_image_catalog_url(self, token: str, region: str) -> str | None:
+        k = (token[:48], region)
+        if k in self._image_endpoint_cache:
+            return self._image_endpoint_cache[k]
+        data = await self.validate_token(token)
+        tok = data.get("token")
+        catalog = tok.get("catalog") if isinstance(tok, dict) else None
+        if not isinstance(catalog, list):
+            catalog = []
+        image = _pick_catalog_url(catalog, "image", region)
+        self._image_endpoint_cache[k] = image
+        return image
 
     async def _get_balances_json(
         self, headers: dict[str, str]
@@ -371,10 +415,16 @@ class SelectelClient:
         return last
 
     async def list_flavors(self, token: str, compute_base: str) -> list[dict[str, Any]]:
-        url = f"{compute_base.rstrip('/')}/flavors/detail"
-        data = await self._request("GET", url, token=token)
-        fl = data.get("flavors") if isinstance(data, dict) else None
-        return [x for x in fl if isinstance(x, dict)] if isinstance(fl, list) else []
+        base = compute_base.rstrip("/")
+        for suffix in ("/flavors/detail", "/flavors"):
+            try:
+                data = await self._request("GET", f"{base}{suffix}", token=token)
+            except SlctlApiError:
+                continue
+            fl = data.get("flavors") if isinstance(data, dict) else None
+            if isinstance(fl, list) and fl:
+                return [x for x in fl if isinstance(x, dict)]
+        return []
 
     async def list_images(self, token: str, compute_base: str) -> list[dict[str, Any]]:
         base = compute_base.rstrip("/")
@@ -384,14 +434,22 @@ class SelectelClient:
             except SlctlApiError:
                 continue
             im = data.get("images") if isinstance(data, dict) else None
-            if isinstance(im, list):
+            if isinstance(im, list) and im:
                 return [x for x in im if isinstance(x, dict)]
         return []
 
+    async def list_glance_images(self, token: str, image_base: str) -> list[dict[str, Any]]:
+        """Glance v2 (часто полнее, чем Nova /images на Selectel)."""
+        url = f"{image_base.rstrip('/')}/v2/images?limit=100"
+        try:
+            data = await self._request("GET", url, token=token)
+        except SlctlApiError:
+            return []
+        imgs = data.get("images") if isinstance(data, dict) else None
+        return [x for x in imgs if isinstance(x, dict)] if isinstance(imgs, list) else []
+
     async def pick_flavor_id(self, token: str, compute_base: str) -> str | None:
         flavors = await self.list_flavors(token, compute_base)
-        if not flavors:
-            return None
 
         def sort_key(f: dict[str, Any]) -> tuple[int, int, str]:
             ram = f.get("ram") or 0
@@ -404,30 +462,35 @@ class SelectelClient:
             fid = str(f.get("id") or "")
             return (r, v, fid)
 
-        flavors.sort(key=sort_key)
-        for f in flavors:
-            fid = str(f.get("id") or "")
-            if fid:
-                return fid
-        return None
+        if flavors:
+            flavors.sort(key=sort_key)
+            for f in flavors:
+                fid = str(f.get("id") or f.get("name") or "").strip()
+                if fid:
+                    return fid
+        fb = str(DEFAULT_SLCTL_FLAVOR_FALLBACK or "").strip()
+        return fb or None
 
     _ubuntu_re = re.compile(r"ubuntu|debian", re.I)
 
-    async def pick_image_id(self, token: str, compute_base: str) -> str | None:
+    def _score_glance_image(self, img: dict[str, Any]) -> tuple[int, str]:
+        name = str(img.get("name") or "")
+        s = 10 if self._ubuntu_re.search(name) else 0
+        return (-s, name)
+
+    async def pick_image_id(self, token: str, region: str, compute_base: str) -> str | None:
         images = await self.list_images(token, compute_base)
         if not images:
+            img_url = await self.get_image_catalog_url(token, region)
+            if img_url:
+                images = await self.list_glance_images(token, img_url)
+        if not images:
             return None
-        active = [i for i in images if str(i.get("status") or "").upper() == "ACTIVE"]
+        active = [i for i in images if str(i.get("status") or "").upper() in ("ACTIVE", "active")]
         pool = active if active else images
-
-        def score(img: dict[str, Any]) -> tuple[int, str]:
-            name = str(img.get("name") or "")
-            s = 10 if self._ubuntu_re.search(name) else 0
-            return (-s, name)
-
-        pool.sort(key=score)
+        pool.sort(key=self._score_glance_image)
         for img in pool:
-            iid = str(img.get("id") or "")
+            iid = str(img.get("id") or "").strip()
             if iid:
                 return iid
         return None
@@ -470,11 +533,11 @@ class SelectelClient:
         if not flavor_ref:
             flavor_ref = await self.pick_flavor_id(token, compute)
         if not image_ref:
-            image_ref = await self.pick_image_id(token, compute)
+            image_ref = await self.pick_image_id(token, region, compute)
         if not flavor_ref or not image_ref:
             raise SlctlApiError(
                 400,
-                "Не удалось подобрать flavor/image в регионе — задайте SLCTL_FLAVOR_ID и SLCTL_IMAGE_ID в .env",
+                "Не удалось подобрать flavor/image в регионе (проверьте IAM и регион SLCTL_IP_LOCATION; при необходимости задайте SLCTL_FLAVOR_ID / SLCTL_IMAGE_ID).",
                 None,
             )
         if not network_uuid:

@@ -35,7 +35,15 @@ CREATE TABLE IF NOT EXISTS accounts (
     slctl_keystone_domain TEXT,
     slctl_keystone_password TEXT,
     slctl_token_issued_ts REAL,
-    slctl_billing_x_token TEXT
+    slctl_billing_x_token TEXT,
+    whitelist_regru TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bot_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    ts REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -76,6 +84,7 @@ class AccountRow:
     slctl_keystone_password: str | None
     slctl_token_issued_ts: float | None
     slctl_billing_x_token: str | None
+    whitelist_regru: str | None
 
 
 def _row_to_account(r: aiosqlite.Row) -> AccountRow:
@@ -104,6 +113,7 @@ def _row_to_account(r: aiosqlite.Row) -> AccountRow:
         slctl_keystone_password=_col(r, "slctl_keystone_password"),
         slctl_token_issued_ts=_col(r, "slctl_token_issued_ts"),
         slctl_billing_x_token=_col(r, "slctl_billing_x_token"),
+        whitelist_regru=_col(r, "whitelist_regru"),
     )
 
 
@@ -141,6 +151,7 @@ class Database:
             ("slctl_keystone_password", "TEXT"),
             ("slctl_token_issued_ts", "REAL"),
             ("slctl_billing_x_token", "TEXT"),
+            ("whitelist_regru", "TEXT"),
         ):
             if col not in have:
                 default = ""
@@ -149,6 +160,16 @@ class Database:
                 await self._db.execute(f"ALTER TABLE accounts ADD COLUMN {col} {sql_typ}{default}")
         await self._db.execute(
             "UPDATE accounts SET provider='timeweb' WHERE provider IS NULL OR provider=''"
+        )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                ts REAL NOT NULL
+            )
+            """
         )
 
     async def close(self) -> None:
@@ -205,6 +226,11 @@ class Database:
         await self._db.commit()
         return cur.rowcount > 0
 
+    async def delete_all_accounts(self) -> int:
+        cur = await self._db.execute("DELETE FROM accounts")
+        await self._db.commit()
+        return cur.rowcount or 0
+
     async def set_brute_enabled(self, name: str, enabled: bool) -> bool:
         cur = await self._db.execute(
             "UPDATE accounts SET brute_enabled=? WHERE name=?",
@@ -254,6 +280,7 @@ class Database:
                 "slctl_keystone_password",
                 "slctl_token_issued_ts",
                 "slctl_billing_x_token",
+                "whitelist_regru",
             }
         )
         fields = {k: v for k, v in fields.items() if k in allowed}
@@ -317,6 +344,34 @@ class Database:
             cur.append(floating_ip_id)
         await self.patch_account(name, {"whitelist_floats": json.dumps(cur)})
 
+    async def remember_bot_outbox(self, thread_id: int, message_id: int) -> None:
+        await self._db.execute(
+            "INSERT INTO bot_outbox (thread_id, message_id, ts) VALUES (?,?,?)",
+            (thread_id, message_id, time.time()),
+        )
+        await self._db.commit()
+
+    async def list_outbox_for_threads(self, thread_ids: list[int]) -> list[tuple[int, int]]:
+        if not thread_ids:
+            return []
+        placeholders = ",".join("?" * len(thread_ids))
+        cur = await self._db.execute(
+            f"SELECT thread_id, message_id FROM bot_outbox WHERE thread_id IN ({placeholders})",
+            thread_ids,
+        )
+        rows = await cur.fetchall()
+        return [(int(r[0]), int(r[1])) for r in rows]
+
+    async def clear_outbox_threads(self, thread_ids: list[int]) -> None:
+        if not thread_ids:
+            return
+        placeholders = ",".join("?" * len(thread_ids))
+        await self._db.execute(
+            f"DELETE FROM bot_outbox WHERE thread_id IN ({placeholders})",
+            thread_ids,
+        )
+        await self._db.commit()
+
     async def append_whitelist_slctl(self, name: str, server_id: str) -> None:
         row = await self.get_account(name)
         if not row:
@@ -331,6 +386,20 @@ class Database:
         if sid and sid not in cur:
             cur.append(sid)
         await self.patch_account(name, {"whitelist_slctl": json.dumps(cur)})
+
+    async def append_whitelist_regru(self, name: str, reglet_id: int) -> None:
+        row = await self.get_account(name)
+        if not row:
+            return
+        try:
+            cur = json.loads(row.whitelist_regru or "[]")
+        except json.JSONDecodeError:
+            cur = []
+        if not isinstance(cur, list):
+            cur = []
+        if reglet_id not in cur:
+            cur.append(reglet_id)
+        await self.patch_account(name, {"whitelist_regru": json.dumps(cur)})
 
     def whitelist_slctl_ids(self, row: AccountRow) -> list[str]:
         try:
@@ -364,6 +433,21 @@ class Database:
         if not isinstance(raw, list):
             return []
         return [str(x) for x in raw if x is not None]
+
+    def whitelist_regru_ids(self, row: AccountRow) -> list[int]:
+        try:
+            raw = json.loads(row.whitelist_regru or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        out: list[int] = []
+        for x in raw:
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     async def log_event(self, kind: str, account: str | None, detail: Any) -> None:
         payload = json.dumps(detail, ensure_ascii=False) if not isinstance(detail, str) else detail
