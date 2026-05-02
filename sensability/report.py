@@ -48,18 +48,18 @@ async def build_daily_report(
         ):
             month_lim += 1
 
-    nets = load_networks(str(cfg.subnets_path))
+    nets = load_networks(str(cfg.timeweb_subnets_path))
 
     bal_min = "—" if snap.balance_min is None else f"{snap.balance_min:g}"
     bal_max = "—" if snap.balance_max is None else f"{snap.balance_max:g}"
     lines = [
         "📊 " + bold("Итоги дня (UpDayWork)"),
         "",
-        f"• Попаданий в ПНА: {bold(str(snap.pool_hits))}",
+        f"• Whitelist: {bold(str(snap.pool_hits))}",
         f"• Успешно создано ВМ (перебор): {bold(str(snap.vm_created_ok))}",
         f"• Успешно создано плавающих IPv4: {bold(str(snap.float_created_ok))}",
         f"• Ошибок создания ресурсов: {bold(str(snap.vm_created_fail))}",
-        f"• ВМ удалено (IP вне ПНА): {bold(str(snap.vm_deleted_no_pool))}",
+        f"• ВМ удалено (IP вне Whitelist): {bold(str(snap.vm_deleted_no_pool))}",
         f"• Проверок IPv4 (опрос): {bold(str(snap.ipv4_checks))}",
         f"• Аккаунтов задействовано в переборе: {bold(str(len(snap.accounts_used)))}",
         f"• Баланс (мин / макс среди задействованных): {bold(bal_min)} / {bold(bal_max)}",
@@ -67,7 +67,7 @@ async def build_daily_report(
         f"• Готовы к перебору (оценка): {bold(str(eligible))}",
         f"• Ошибка «пополните на месяц» (лимит час): {bold(str(month_lim))} акк. в ограничении",
         "",
-        f"Пул ПНА: {code(str(len(nets)))} подсетей в {code(str(cfg.subnets_path))}",
+        f"Whitelist (Timeweb): {code(str(len(nets)))} подсетей в {code(str(cfg.timeweb_subnets_path))}",
     ]
     text = "\n".join(lines)
 

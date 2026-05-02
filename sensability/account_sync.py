@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.jwt_util import jwt_payload_unverified
-from sensability.slctl_constants import SLCTL_TOKEN_REFRESH_MAX_AGE_SEC
-from sensability.regru_client import RegruClient
-from sensability.regru_ops import regru_refresh_whitelist
 from sensability.slctl_client import SelectelClient
+from sensability.slctl_constants import SLCTL_TOKEN_REFRESH_MAX_AGE_SEC
 from sensability.twc_constants import (
     TWC_FLOAT_IP_BALANCE_THRESHOLD_RUB,
     TWC_MONTH_LIMIT_COOLDOWN_SEC,
@@ -20,10 +18,6 @@ from sensability.twc_client import (
     deep_find_full_name,
     finances_balance_rubles,
 )
-
-if TYPE_CHECKING:
-    pass
-
 
 def _expire_limits(row: AccountRow, now: float) -> dict[str, Any]:
     patch: dict[str, Any] = {}
@@ -91,7 +85,6 @@ async def _sync_timeweb(
 async def _ensure_selectel_iam_token(
     db: Database, slctl: SelectelClient, name: str, row: AccountRow
 ) -> AccountRow:
-    """Если в БД есть логин/домен/пароль — при необходимости выдаём новый X-Subject-Token."""
     use_pw = (
         row.slctl_keystone_user
         and row.slctl_keystone_domain
@@ -113,40 +106,10 @@ async def _ensure_selectel_iam_token(
     )
     await db.patch_account(
         name,
-        {
-            "api_key": tok,
-            "slctl_token_issued_ts": now,
-            "acc_login": row.slctl_keystone_user,
-        },
+        {"api_key": tok, "slctl_token_issued_ts": now, "acc_login": row.slctl_keystone_user},
     )
     out = await db.get_account(name)
     return out if out else row
-
-
-async def _sync_regru(
-    db: Database, regru: RegruClient, cfg: Config, name: str, row: AccountRow
-) -> AccountRow | None:
-    now = time.time()
-    patch = _expire_limits(row, now)
-    bal: float | None = None
-    try:
-        bd = await regru.get_balance_data(row.api_key)
-        if bd and bd.get("balance") is not None:
-            bal = float(bd["balance"])
-    except Exception:
-        pass
-    limited_by_balance = False
-    if bal is not None and bal < cfg.regru_minimum_rubles:
-        limited_by_balance = True
-    patch["balance_cached"] = bal
-    patch["currency"] = "RUB"
-    patch["limited_by_balance"] = 1 if limited_by_balance else 0
-    await db.patch_account(name, patch)
-    row2 = await db.get_account(name)
-    if not row2:
-        return None
-    await regru_refresh_whitelist(db, regru, cfg, name, row2, delete_bot_vms=False)
-    return await db.get_account(name)
 
 
 async def _sync_selectel(
@@ -157,9 +120,7 @@ async def _sync_selectel(
     row = await _ensure_selectel_iam_token(db, slctl, name, row)
     billing_xt = (row.slctl_billing_x_token or cfg.slctl_billing_x_token or "").strip() or None
     bal, cur = await slctl.get_balance_rub(row.api_key, billing_x_token=billing_xt)
-    limited_by_balance = False
-    if bal is not None and bal < cfg.slctl_minimum_rubles:
-        limited_by_balance = True
+    limited_by_balance = bool(bal is not None and bal < cfg.slctl_minimum_rubles)
     patch["balance_cached"] = bal
     patch["currency"] = cur or "RUB"
     patch["limited_by_balance"] = 1 if limited_by_balance else 0
@@ -171,7 +132,6 @@ async def sync_account(
     db: Database,
     twc: TimewebClient,
     slctl: SelectelClient,
-    regru: RegruClient,
     cfg: Config,
     name: str,
 ) -> AccountRow | None:
@@ -180,14 +140,12 @@ async def sync_account(
         return None
     if row.provider == "selectel":
         return await _sync_selectel(db, slctl, cfg, name, row)
-    if row.provider == "regru":
-        return await _sync_regru(db, regru, cfg, name, row)
     return await _sync_timeweb(db, twc, cfg, name, row)
 
 
 def account_prefers_floating_ip_probe(row: AccountRow) -> bool:
     """Баланс выше порога в рублях — перебор через заказ плавающего IPv4 (без ВМ)."""
-    if row.provider in ("selectel", "regru"):
+    if row.provider != "timeweb":
         return False
     if row.balance_cached is None:
         return False
@@ -209,10 +167,8 @@ def account_eligible_for_brute(row: AccountRow, cfg: Config) -> bool:
         if row.balance_cached is not None and row.balance_cached < cfg.slctl_minimum_rubles:
             return False
         return True
-    if row.provider == "regru":
-        if row.balance_cached is not None and row.balance_cached < cfg.regru_minimum_rubles:
-            return False
-        return True
+    if row.provider != "timeweb":
+        return False
     if row.limited_by_month and row.limited_by_month_ts:
         if now < row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC:
             return False

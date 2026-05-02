@@ -91,8 +91,8 @@ class Config:
     regru_minimum_rubles: float
     data_dir: Path
     compose_dir: Path
-    subnets_path: Path
-    potential_subnets_path: Path
+    timeweb_subnets_path: Path
+    selectel_subnets_path: Path
 
 
 def _resolve_compose_dir(package_root: Path) -> Path:
@@ -120,8 +120,12 @@ def load_config() -> Config:
     data_dir = Path(os.getenv("SENSABILITY_DATA_DIR", "/app/data"))
     data_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parent.parent
-    subnets = Path(os.getenv("SENSABILITY_SUBNETS_PATH", str(root / "subnets.txt")))
-    potential = Path(os.getenv("SENSABILITY_POTENTIAL_SUBNETS_PATH", str(root / "potential_subnets.txt")))
+    timeweb_subnets = Path(
+        os.getenv("SENSABILITY_TWC_SUBNETS_PATH", os.getenv("SENSABILITY_SUBNETS_PATH", str(root / "timewebcloud_subnets.txt")))
+    )
+    selectel_subnets = Path(
+        os.getenv("SENSABILITY_SLCTL_SUBNETS_PATH", str(root / "selectel_subnets.txt"))
+    )
     compose = _resolve_compose_dir(root)
 
     return Config(
@@ -168,6 +172,6 @@ def load_config() -> Config:
         regru_minimum_rubles=_float(os.getenv("REGRU_MINIMUM_RUBLES"), 0.0),
         data_dir=data_dir,
         compose_dir=compose,
-        subnets_path=subnets,
-        potential_subnets_path=potential,
+        timeweb_subnets_path=timeweb_subnets,
+        selectel_subnets_path=selectel_subnets,
     )

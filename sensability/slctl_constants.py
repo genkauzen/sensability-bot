@@ -16,4 +16,4 @@ DEFAULT_SLCTL_EXTRA_CIDR_URL = (
 DEFAULT_SLCTL_FLAVOR_FALLBACK = "1311"
 
 # Регионы Neutron для заказа плавающих IPv4 (перебор вместо Nova ВМ).
-DEFAULT_SLCTL_FLOAT_REGIONS: tuple[str, ...] = ("ru-2", "ru-7", "ru-1", "ru-9")
+DEFAULT_SLCTL_FLOAT_REGIONS: tuple[str, ...] = ("ru-2", "ru-3")

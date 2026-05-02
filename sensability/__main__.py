@@ -13,15 +13,9 @@ from sensability.brute_worker import BruteOrchestrator
 from sensability.config import Config, load_config
 from sensability.db import Database, db_path
 from sensability.handlers import on_message, schedule_daily
-from sensability.ip_pool import (
-    fetch_cidr_networks_from_url,
-    load_networks,
-    load_potential_networks,
-    merge_ipv4_networks,
-)
-from sensability.regru_client import RegruClient
-from sensability.slctl_client import SelectelClient
+from sensability.ip_pool import load_networks
 from sensability.notify import TelegramNotify
+from sensability.slctl_client import SelectelClient
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, esc
 from sensability.twc_client import TimewebClient
@@ -45,13 +39,11 @@ async def post_shutdown(application: Application) -> None:
     orch: BruteOrchestrator = application.bot_data["orchestrator"]
     twc: TimewebClient = application.bot_data["twc"]
     slctl: SelectelClient = application.bot_data["slctl"]
-    regru: RegruClient = application.bot_data["regru"]
     db: Database = application.bot_data["db"]
     notify: TelegramNotify = application.bot_data["notify"]
     await orch.stop()
     await twc.aclose()
     await slctl.aclose()
-    await regru.aclose()
     await db.close()
     try:
         await notify.logs("⏹ " + bold("Sensability остановлен"))
@@ -74,9 +66,14 @@ def main() -> None:
     )
 
     try:
-        load_networks(str(cfg.subnets_path))
+        load_networks(str(cfg.timeweb_subnets_path))
     except FileNotFoundError:
-        print(f"Файл подсетей не найден: {cfg.subnets_path}", file=sys.stderr)
+        print(f"Файл подсетей Timeweb не найден: {cfg.timeweb_subnets_path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        load_networks(str(cfg.selectel_subnets_path))
+    except FileNotFoundError:
+        print(f"Файл подсетей Selectel не найден: {cfg.selectel_subnets_path}", file=sys.stderr)
         sys.exit(1)
 
     proxy = cfg.tg_proxy_url if cfg.tg_proxy_use and cfg.tg_proxy_url else None
@@ -105,34 +102,12 @@ def main() -> None:
         await notify.terminal_reply(tid, html)
 
     twc = TimewebClient(twc_proxy, debug_ctrl=twc_debug, debug_emit=twc_debug_emit)
-    nets = load_networks(str(cfg.subnets_path))
-    pot = load_potential_networks(str(cfg.potential_subnets_path))
-    extra_slctl: tuple = ()
-    try:
-        extra_slctl = fetch_cidr_networks_from_url(cfg.slctl_whitelist_cidr_url)
-        log.info("Selectel extra CIDR lines: %s", len(extra_slctl))
-    except Exception as ex:
-        log.warning("Selectel whitelist CIDR URL failed (%s): %s", cfg.slctl_whitelist_cidr_url, ex)
-    nets_selectel = merge_ipv4_networks(nets, extra_slctl)
-
     slctl_proxy = cfg.slctl_proxy_url if cfg.slctl_proxy_use and cfg.slctl_proxy_url else None
     slctl_debug = TwcApiDebugController()
-    regru_debug = TwcApiDebugController()
-
-    async def terminal_api_debug_emit(html: str) -> None:
-        tid = cfg.topic_terminal
-        if tid is None:
-            return
-        await notify.terminal_reply(tid, html)
-
-    slctl = SelectelClient(
-        slctl_proxy, debug_ctrl=slctl_debug, debug_emit=terminal_api_debug_emit
-    )
-    regru = RegruClient(twc_proxy, debug_ctrl=regru_debug, debug_emit=terminal_api_debug_emit)
-
-    orchestrator = BruteOrchestrator(
-        cfg, db, twc, slctl, regru, stats, notify, nets, pot, nets_selectel
-    )
+    slctl = SelectelClient(slctl_proxy, debug_ctrl=slctl_debug, debug_emit=twc_debug_emit)
+    tw_nets = load_networks(str(cfg.timeweb_subnets_path))
+    sl_nets = load_networks(str(cfg.selectel_subnets_path))
+    orchestrator = BruteOrchestrator(cfg, db, twc, slctl, stats, notify, tw_nets, sl_nets)
 
     tz = os.getenv("TZ", "Europe/Moscow")
     application.bot_data.update(
@@ -140,10 +115,8 @@ def main() -> None:
         db=db,
         twc=twc,
         slctl=slctl,
-        regru=regru,
         twc_debug=twc_debug,
         slctl_debug=slctl_debug,
-        regru_debug=regru_debug,
         stats=stats,
         notify=notify,
         orchestrator=orchestrator,
