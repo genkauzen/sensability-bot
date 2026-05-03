@@ -11,6 +11,11 @@ from sensability.slctl_constants import (
     DEFAULT_SLCTL_FLOAT_REGIONS,
 )
 
+# Файлы whitelist IPv4 по умолчанию (корень репозитория или смонтированный /compose в Docker).
+DEFAULT_TIMEWEB_SUBNETS_FILENAME = "timewebcloud_subnets.txt"
+DEFAULT_SELECTEL_SUBNETS_FILENAME = "selectel_subnets.txt"
+DEFAULT_REGRU_SUBNETS_FILENAME = "regru_subnets.txt"
+
 
 def _bool(v: str | None, default: bool = False) -> bool:
     if v is None or v.strip() == "":
@@ -155,9 +160,15 @@ def load_config() -> Config:
     tw_explicit = _subnet_file_override_only("SENSABILITY_TWC_SUBNETS_PATH", "SENSABILITY_SUBNETS_PATH")
     sl_explicit = _subnet_file_override_only("SENSABILITY_SLCTL_SUBNETS_PATH", None)
     rg_explicit = _subnet_file_override_only("SENSABILITY_REGRU_SUBNETS_PATH", None)
-    timeweb_subnets = resolve_subnet_file(package_parent, compose, "timewebcloud_subnets.txt", explicit=tw_explicit)
-    selectel_subnets = resolve_subnet_file(package_parent, compose, "selectel_subnets.txt", explicit=sl_explicit)
-    regru_subnets = resolve_subnet_file(package_parent, compose, "regru_subnets.txt", explicit=rg_explicit)
+    timeweb_subnets = resolve_subnet_file(
+        package_parent, compose, DEFAULT_TIMEWEB_SUBNETS_FILENAME, explicit=tw_explicit
+    )
+    selectel_subnets = resolve_subnet_file(
+        package_parent, compose, DEFAULT_SELECTEL_SUBNETS_FILENAME, explicit=sl_explicit
+    )
+    regru_subnets = resolve_subnet_file(
+        package_parent, compose, DEFAULT_REGRU_SUBNETS_FILENAME, explicit=rg_explicit
+    )
 
     return Config(
         bot_token=os.getenv("BOT_TOKEN", "").strip(),

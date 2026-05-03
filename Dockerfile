@@ -19,7 +19,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY sensability ./sensability
-COPY subnets.txt ./subnets.txt
+COPY timewebcloud_subnets.txt ./timewebcloud_subnets.txt
+COPY selectel_subnets.txt ./selectel_subnets.txt
+COPY regru_subnets.txt ./regru_subnets.txt
 
 ENV PYTHONUNBUFFERED=1
 # SQLite и прочие данные по умолчанию; в compose примонтируйте том на ./data
