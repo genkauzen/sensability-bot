@@ -130,25 +130,11 @@ def _subnet_file_override_only(env_primary: str, env_legacy: str | None) -> Path
     return Path(raw).expanduser() if raw else None
 
 
-def resolve_subnet_file(package_parent: Path, compose_dir: Path, filename: str, *, explicit: Path | None) -> Path:
-    """Файл whitelist-подсетей: явный env или первый найденный среди типичных мест (в т.ч. /compose при docker-compose)."""
+def resolve_subnet_file(base_dir: Path, filename: str, *, explicit: Path | None) -> Path:
+    """Файл whitelist-подсетей: явный env или файл в директории приложения."""
     if explicit is not None:
         return explicit.resolve()
-    package_dir = Path(__file__).resolve().parent
-    candidates = (
-        compose_dir / filename,
-        Path.cwd() / filename,
-        package_parent / filename,
-        package_dir / filename,
-    )
-    for p in candidates:
-        try:
-            rp = p.resolve()
-            if rp.is_file():
-                return rp
-        except OSError:
-            continue
-    return (compose_dir / filename).resolve()
+    return (base_dir / filename).resolve()
 
 
 def load_config() -> Config:
@@ -160,15 +146,10 @@ def load_config() -> Config:
     tw_explicit = _subnet_file_override_only("SENSABILITY_TWC_SUBNETS_PATH", "SENSABILITY_SUBNETS_PATH")
     sl_explicit = _subnet_file_override_only("SENSABILITY_SLCTL_SUBNETS_PATH", None)
     rg_explicit = _subnet_file_override_only("SENSABILITY_REGRU_SUBNETS_PATH", None)
-    timeweb_subnets = resolve_subnet_file(
-        package_parent, compose, DEFAULT_TIMEWEB_SUBNETS_FILENAME, explicit=tw_explicit
-    )
-    selectel_subnets = resolve_subnet_file(
-        package_parent, compose, DEFAULT_SELECTEL_SUBNETS_FILENAME, explicit=sl_explicit
-    )
-    regru_subnets = resolve_subnet_file(
-        package_parent, compose, DEFAULT_REGRU_SUBNETS_FILENAME, explicit=rg_explicit
-    )
+    # По умолчанию читаем *.txt рядом с приложением (WORKDIR=/app).
+    timeweb_subnets = resolve_subnet_file(package_parent, DEFAULT_TIMEWEB_SUBNETS_FILENAME, explicit=tw_explicit)
+    selectel_subnets = resolve_subnet_file(package_parent, DEFAULT_SELECTEL_SUBNETS_FILENAME, explicit=sl_explicit)
+    regru_subnets = resolve_subnet_file(package_parent, DEFAULT_REGRU_SUBNETS_FILENAME, explicit=rg_explicit)
 
     return Config(
         bot_token=os.getenv("BOT_TOKEN", "").strip(),
