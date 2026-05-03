@@ -6,20 +6,23 @@ import re
 from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.ip_pool import ipv4_in_pool, load_networks
-from sensability.regru_client import RegruClient, regru_ip_record_is_spb_ipv4, regru_is_spb_region
-from sensability.regru_constants import REGRU_REGION_SPB
+from sensability.regru_client import (
+    RegruClient,
+    regru_ip_record_is_region_ipv4,
+    regru_reglet_in_region,
+)
 
 log = logging.getLogger("sensability.regru")
 
 _ubuntu_re = re.compile(r"ubuntu|debian", re.I)
 
 
-async def regru_pick_spb_plan_and_image(
-    regru: RegruClient, token: str
+async def regru_pick_plan_and_image(
+    regru: RegruClient, token: str, region: str
 ) -> tuple[str, str | int] | None:
-    """Минимальный тариф + образ ОС в openstack-spb1 для POST /v1/reglets."""
+    """Минимальный тариф + образ ОС для POST /v1/reglets (slug из /v2/plans и /v2/images)."""
     try:
-        plans = await regru.v2_plans(token, region=REGRU_REGION_SPB, page=1, per_page=80)
+        plans = await regru.v2_plans(token, region=region, page=1, per_page=80)
     except Exception:
         log.exception("regru v2_plans")
         return None
@@ -42,7 +45,7 @@ async def regru_pick_spb_plan_and_image(
     if not size_slug:
         return None
     try:
-        images = await regru.v2_images(token, region=REGRU_REGION_SPB, page=1, per_page=50)
+        images = await regru.v2_images(token, region=region, page=1, per_page=50)
     except Exception:
         log.exception("regru v2_images")
         return None
@@ -68,9 +71,10 @@ async def regru_refresh_whitelist(
     *,
     delete_bot_vms: bool,
 ) -> None:
-    """ВМ в регионе Санкт-Петербург (region_slug содержит spb): IP из subnets.txt → белый список.
+    """ВМ в регионе cfg.regru_region: IP из regru_subnets.txt → белый список.
     При delete_bot_vms — удаляются только ВМ с именем {TWC_VM_NAME}-regru-*, не в ПНА и не в белом списке."""
-    nets = load_networks(str(cfg.subnets_path))
+    nets = load_networks(str(cfg.regru_subnets_path))
+    region_cfg = cfg.regru_region.strip() or "openstack-msk1"
     try:
         reglets = await regru.list_reglets(row.api_key)
     except Exception:
@@ -82,7 +86,7 @@ async def regru_refresh_whitelist(
     prefix = f"{cfg.twc_vm_name}-regru-".lower()
 
     for raw in reglets:
-        if not regru_is_spb_region(raw):
+        if not regru_reglet_in_region(raw, region_cfg):
             continue
         rid = raw.get("id")
         try:
@@ -112,7 +116,7 @@ async def regru_refresh_whitelist(
         log.exception("regru list_ips whitelist %s", name)
         return
     for rec in ips:
-        if not isinstance(rec, dict) or not regru_ip_record_is_spb_ipv4(rec):
+        if not isinstance(rec, dict) or not regru_ip_record_is_region_ipv4(rec, region_cfg):
             continue
         ip_s = str(rec.get("ip") or "").strip()
         if not ip_s or ip_s.count(".") != 3:

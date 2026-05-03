@@ -17,6 +17,37 @@ from sensability.twc_debug import (
 REGRU_API_BASE = "https://api.cloudvps.reg.ru"
 
 
+def regru_slug_matches_region(region_slug: str | None, configured_region: str) -> bool:
+    """Сопоставляет region_slug из API (msk1, openstack-msk1, …) с REGRU_REGION (openstack-msk1)."""
+    s = str(region_slug or "").lower()
+    r = configured_region.lower().strip()
+    if not r:
+        return True
+    if r in s:
+        return True
+    short = r.split("openstack-", 1)[-1] if "openstack-" in r else r
+    return bool(short and short in s)
+
+
+def regru_balance_from_balance_data(bd: dict[str, Any]) -> tuple[float | None, str | None]:
+    for key in (
+        "balance",
+        "real_balance",
+        "money_balance",
+        "available_balance",
+        "payed_balance",
+        "prepaid_balance",
+    ):
+        raw = bd.get(key)
+        if raw is None:
+            continue
+        try:
+            return float(raw), "RUB"
+        except (TypeError, ValueError):
+            continue
+    return None, None
+
+
 class RegruApiError(Exception):
     def __init__(self, status: int, body: str) -> None:
         super().__init__(f"Reg.ru CloudVPS HTTP {status}: {body[:500]}")
@@ -29,14 +60,22 @@ def regru_is_spb_region(reglet: dict[str, Any]) -> bool:
     return "spb" in slug
 
 
-def regru_ip_record_is_spb_ipv4(rec: dict[str, Any]) -> bool:
+def regru_ip_record_is_region_ipv4(rec: dict[str, Any], configured_region: str) -> bool:
     t = str(rec.get("type") or "").lower()
     if t != "ipv4":
         return False
-    slug = str(rec.get("region_slug") or "").lower()
-    if not slug:
+    slug = rec.get("region_slug")
+    if slug is None or str(slug).strip() == "":
         return True
-    return "spb" in slug
+    return regru_slug_matches_region(str(slug), configured_region)
+
+
+def regru_ip_record_is_spb_ipv4(rec: dict[str, Any]) -> bool:
+    return regru_ip_record_is_region_ipv4(rec, "openstack-spb1")
+
+
+def regru_reglet_in_region(reglet: dict[str, Any], configured_region: str) -> bool:
+    return regru_slug_matches_region(str(reglet.get("region_slug") or ""), configured_region)
 
 
 class RegruClient:

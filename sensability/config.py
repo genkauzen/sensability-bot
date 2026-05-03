@@ -93,6 +93,8 @@ class Config:
     compose_dir: Path
     timeweb_subnets_path: Path
     selectel_subnets_path: Path
+    regru_subnets_path: Path
+    regru_region: str
 
 
 def _resolve_compose_dir(package_root: Path) -> Path:
@@ -115,18 +117,47 @@ def _resolve_compose_dir(package_root: Path) -> Path:
     return package_root
 
 
+def _subnet_file_override_only(env_primary: str, env_legacy: str | None) -> Path | None:
+    """Явный путь из переменных окружения (без автопоиска)."""
+    raw = (os.getenv(env_primary) or "").strip()
+    if not raw and env_legacy:
+        raw = (os.getenv(env_legacy) or "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def resolve_subnet_file(package_parent: Path, compose_dir: Path, filename: str, *, explicit: Path | None) -> Path:
+    """Файл whitelist-подсетей: явный env или первый найденный среди типичных мест (в т.ч. /compose при docker-compose)."""
+    if explicit is not None:
+        return explicit.resolve()
+    package_dir = Path(__file__).resolve().parent
+    candidates = (
+        compose_dir / filename,
+        Path.cwd() / filename,
+        package_parent / filename,
+        package_dir / filename,
+    )
+    for p in candidates:
+        try:
+            rp = p.resolve()
+            if rp.is_file():
+                return rp
+        except OSError:
+            continue
+    return (compose_dir / filename).resolve()
+
+
 def load_config() -> Config:
     load_dotenv()
     data_dir = Path(os.getenv("SENSABILITY_DATA_DIR", "/app/data"))
     data_dir.mkdir(parents=True, exist_ok=True)
-    root = Path(__file__).resolve().parent.parent
-    timeweb_subnets = Path(
-        os.getenv("SENSABILITY_TWC_SUBNETS_PATH", os.getenv("SENSABILITY_SUBNETS_PATH", str(root / "timewebcloud_subnets.txt")))
-    )
-    selectel_subnets = Path(
-        os.getenv("SENSABILITY_SLCTL_SUBNETS_PATH", str(root / "selectel_subnets.txt"))
-    )
-    compose = _resolve_compose_dir(root)
+    package_parent = Path(__file__).resolve().parent.parent
+    compose = _resolve_compose_dir(package_parent)
+    tw_explicit = _subnet_file_override_only("SENSABILITY_TWC_SUBNETS_PATH", "SENSABILITY_SUBNETS_PATH")
+    sl_explicit = _subnet_file_override_only("SENSABILITY_SLCTL_SUBNETS_PATH", None)
+    rg_explicit = _subnet_file_override_only("SENSABILITY_REGRU_SUBNETS_PATH", None)
+    timeweb_subnets = resolve_subnet_file(package_parent, compose, "timewebcloud_subnets.txt", explicit=tw_explicit)
+    selectel_subnets = resolve_subnet_file(package_parent, compose, "selectel_subnets.txt", explicit=sl_explicit)
+    regru_subnets = resolve_subnet_file(package_parent, compose, "regru_subnets.txt", explicit=rg_explicit)
 
     return Config(
         bot_token=os.getenv("BOT_TOKEN", "").strip(),
@@ -174,4 +205,6 @@ def load_config() -> Config:
         compose_dir=compose,
         timeweb_subnets_path=timeweb_subnets,
         selectel_subnets_path=selectel_subnets,
+        regru_subnets_path=regru_subnets,
+        regru_region=(os.getenv("REGRU_REGION") or "openstack-msk1").strip(),
     )

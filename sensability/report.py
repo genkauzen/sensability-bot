@@ -49,6 +49,7 @@ async def build_daily_report(
             month_lim += 1
 
     nets = load_networks(str(cfg.timeweb_subnets_path))
+    rg_nets = load_networks(str(cfg.regru_subnets_path))
 
     bal_min = "—" if snap.balance_min is None else f"{snap.balance_min:g}"
     bal_max = "—" if snap.balance_max is None else f"{snap.balance_max:g}"
@@ -68,6 +69,7 @@ async def build_daily_report(
         f"• Ошибка «пополните на месяц» (лимит час): {bold(str(month_lim))} акк. в ограничении",
         "",
         f"Whitelist (Timeweb): {code(str(len(nets)))} подсетей в {code(str(cfg.timeweb_subnets_path))}",
+        f"Whitelist (Reg.ru): {code(str(len(rg_nets)))} подсетей в {code(str(cfg.regru_subnets_path))}",
     ]
     text = "\n".join(lines)
 

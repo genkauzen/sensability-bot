@@ -18,6 +18,12 @@ from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.ip_pool import load_networks
 from sensability.notify import TelegramNotify
+from sensability.regru_client import (
+    RegruClient,
+    regru_balance_from_balance_data,
+    regru_ip_record_is_region_ipv4,
+    regru_reglet_in_region,
+)
 from sensability.report import build_daily_report
 from sensability.slctl_client import SelectelClient, extract_public_ipv4_from_nova_server
 from sensability.stats import StatsCollector
@@ -41,7 +47,7 @@ log = logging.getLogger("sensability.handlers")
 RE_TWC_FLOAT_ZONE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 
 RE_ACCOUNT_ADD = re.compile(
-    r"^/(?:account_add_twc|account_add)\s+(?:(timeweb|twc|selectel|slctl)\s+)?(.+)$",
+    r"^/(?:account_add_twc|account_add)\s+(?:(timeweb|twc|selectel|slctl|regru)\s+)?(.+)$",
     re.I,
 )
 RE_ACCOUNT_INFO = re.compile(r"^/account_info\s+(.+)$", re.I)
@@ -149,6 +155,50 @@ async def _slctl_account_resources_block(db: Database, slctl: SelectelClient, cf
     return lines
 
 
+async def _regru_account_resources_block(db: Database, regru: RegruClient, cfg: Config, row: AccountRow) -> list[str]:
+    if row.provider != "regru":
+        return []
+    region_cfg = cfg.regru_region.strip() or "openstack-msk1"
+    w_reg = set(db.whitelist_regru_ids(row))
+    w_ip = set(db.whitelist_regru_ip_ids(row))
+    try:
+        reglets = await regru.list_reglets(row.api_key)
+    except Exception as ex:
+        return ["┈ " + bold("ВМ Reg.ru") + f": ❌ {esc(str(ex)[:280])}"]
+    in_reg = [x for x in reglets if isinstance(x, dict) and regru_reglet_in_region(x, region_cfg)]
+    lines: list[str] = ["┈ " + bold("ВМ Reg.ru (регион перебора)") + f" ({code(str(len(in_reg)))})"]
+    for rg in in_reg[:35]:
+        rid = rg.get("id")
+        rid_s = str(rid).strip() if rid is not None else "—"
+        ip = str(rg.get("ip") or "").strip() or "—"
+        try:
+            rid_i = int(rid)
+            wl = " · 🔒 белый список" if rid_i in w_reg else ""
+        except (TypeError, ValueError):
+            wl = ""
+        lines.append(f"   • id {code(rid_s)} · IPv4 {code(ip)}{wl}")
+    try:
+        ips = await regru.list_ips(row.api_key)
+    except Exception as ex:
+        lines.append("┈ " + bold("IPv4 Reg.ru") + f": ❌ {esc(str(ex)[:280])}")
+        return lines
+    rows_ip = [
+        x
+        for x in ips
+        if isinstance(x, dict) and regru_ip_record_is_region_ipv4(x, region_cfg)
+    ]
+    lines.append("┈ " + bold("Записи IPv4 API") + f" ({code(str(len(rows_ip)))})")
+    for rec in rows_ip[:35]:
+        ip_s = str(rec.get("ip") or "").strip() or "—"
+        try:
+            ip_id = int(rec.get("id"))
+            wl = " · 🔒 белый список" if ip_id in w_ip else ""
+        except (TypeError, ValueError):
+            wl = ""
+        lines.append(f"   • id {code(str(rec.get('id') or '—'))} · {code(ip_s)}{wl}")
+    return lines
+
+
 def _uid(update: Update) -> str | None:
     u = update.effective_user
     return str(u.id) if u else None
@@ -189,6 +239,7 @@ async def handle_account_terminal_commands(
     db: Database,
     twc: TimewebClient,
     slctl: SelectelClient,
+    regru: RegruClient,
     text: str,
     reply: Callable[[str], Awaitable[None]],
 ) -> bool:
@@ -208,7 +259,12 @@ async def handle_account_terminal_commands(
             bal = "—" if r.balance_cached is None else f"{r.balance_cached:g}"
             cur = esc(r.currency or "")
             be = "🟢" if r.brute_enabled else "⚫"
-            prov = "SL" if r.provider == "selectel" else "TW"
+            if r.provider == "selectel":
+                prov = "SL"
+            elif r.provider == "regru":
+                prov = "RG"
+            else:
+                prov = "TW"
             lim = []
             if r.limited_by_balance:
                 lim.append("баланс")
@@ -264,7 +320,7 @@ async def handle_account_terminal_commands(
         else:
             unknown.append(fl)
     try:
-        synced = await sync_account(db, twc, slctl, cfg, name)
+        synced = await sync_account(db, twc, slctl, regru, cfg, name)
         row = synced if synced else await db.get_account(name)
     except Exception:
         row = await db.get_account(name)
@@ -282,6 +338,9 @@ async def handle_account_terminal_commands(
     if row.provider == "selectel":
         mode_ip = "📡 Selectel Neutron — плавающий IPv4"
         res_lines = await _slctl_account_resources_block(db, slctl, cfg, row)
+    elif row.provider == "regru":
+        mode_ip = "🖥 Reg.ru CloudVPS — ВМ (" + esc(cfg.regru_region.strip() or "openstack-msk1") + ")"
+        res_lines = await _regru_account_resources_block(db, regru, cfg, row)
     else:
         mode_ip = (
             "📡 плавающий IPv4 (без ВМ)"
@@ -293,7 +352,12 @@ async def handle_account_terminal_commands(
         "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
         "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
     ]
-    prov_label = "Selectel" if row.provider == "selectel" else "Timeweb"
+    if row.provider == "selectel":
+        prov_label = "Selectel"
+    elif row.provider == "regru":
+        prov_label = "Reg.ru"
+    else:
+        prov_label = "Timeweb"
     panel = "\n".join(
         [
             "🪪 " + bold("Управление аккаунтом") + f" {code(name)}",
@@ -407,6 +471,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     cfg, db, twc, slctl, stats, notify, orch = _ctx(context.application)
+    regru: RegruClient = context.application.bot_data["regru"]
     tid = update.message.message_thread_id if update.message else None
     low = text.lower().strip()
 
@@ -428,6 +493,7 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 "/account_list — список аккаунтов",
                 "/account_mng имя — карточка и флаги: -on -off -heal -day -month -balance",
                 "/account_add selectel name | IAM_token — подключить Selectel",
+                "/account_add regru name | api_token — Reg.ru CloudVPS (перебор Москва)",
                 "/help — этот список",
             ]
         )
@@ -571,7 +637,7 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     async def _acc_reply(html: str) -> None:
         await notify.terminal_reply(tid, html)
 
-    if await handle_account_terminal_commands(cfg, db, twc, slctl, text, _acc_reply):
+    if await handle_account_terminal_commands(cfg, db, twc, slctl, regru, text, _acc_reply):
         return
 
     if low == "/modules":
@@ -593,6 +659,7 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         snap = stats.snapshot
         tw_nets = load_networks(str(cfg.timeweb_subnets_path))
         sl_nets = load_networks(str(cfg.selectel_subnets_path))
+        rg_nets = load_networks(str(cfg.regru_subnets_path))
         started = float(context.application.bot_data.get("started_at", time.time()))
         up = int(time.time() - started)
         body = "\n".join(
@@ -602,6 +669,7 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 f"Аптайм: {code(str(up))} с",
                 f"Whitelist Timeweb: {code(str(len(tw_nets)))}",
                 f"Whitelist Selectel: {code(str(len(sl_nets)))}",
+                f"Whitelist Reg.ru: {code(str(len(rg_nets)))}",
                 f"Проверок IPv4 (сессия): {code(str(snap.ipv4_checks))}",
                 f"Whitelist (сессия): {code(str(snap.pool_hits))}",
                 f"Параллельных аккаунтов: {code(str(cfg.twc_atmoment_acc))}",
@@ -626,19 +694,25 @@ async def handle_terminal(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 
 async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     cfg, db, twc, slctl, stats, notify, _orch = _ctx(context.application)
+    regru: RegruClient = context.application.bot_data["regru"]
     tid = update.message.message_thread_id if update.message else None
 
     async def _vreply(html: str) -> None:
         await notify.accountverify_reply(tid, html)
 
-    if await handle_account_terminal_commands(cfg, db, twc, slctl, text, _vreply):
+    if await handle_account_terminal_commands(cfg, db, twc, slctl, regru, text, _vreply):
         return
 
     m = RE_ACCOUNT_ADD.match(text)
     if m:
         prov_raw = (m.group(1) or "").strip().lower()
         rest = (m.group(2) or "").strip()
-        prov = "selectel" if prov_raw in ("selectel", "slctl") else "timeweb"
+        if prov_raw in ("selectel", "slctl"):
+            prov = "selectel"
+        elif prov_raw == "regru":
+            prov = "regru"
+        else:
+            prov = "timeweb"
         bal: float | None = None
         cur: str | None = None
         name, key = _split_name_key(rest)
@@ -650,6 +724,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                         "Форматы:",
                         code("/account_add timeweb name | token"),
                         code("/account_add selectel name | IAM_token"),
+                        code("/account_add regru name | api_token"),
                     ]
                 ),
             )
@@ -661,6 +736,15 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as ex:
                 await notify.accountverify_reply(tid, f"❌ Selectel IAM токен не подошёл: {esc(str(ex)[:500])}")
                 return
+        elif prov == "regru":
+            try:
+                bd = await regru.get_balance_data(key)
+                if bd is None:
+                    await regru.list_reglets(key)
+                bal, cur = regru_balance_from_balance_data(bd if isinstance(bd, dict) else {})
+            except Exception as ex:
+                await notify.accountverify_reply(tid, f"❌ Reg.ru API токен не подошёл: {esc(str(ex)[:500])}")
+                return
         else:
             try:
                 fin = await twc.get_finances(key)
@@ -669,13 +753,18 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                 await notify.accountverify_reply(tid, f"❌ API ключ не подошёл: {esc(str(ex)[:400])}")
                 return
         await db.add_account(name, key, provider=prov)
-        row = await sync_account(db, twc, slctl, cfg, name)
+        row = await sync_account(db, twc, slctl, regru, cfg, name)
         em = row.acc_email if row else None
         lg = row.acc_login if row else None
         fn = row.acc_full_name if row else None
         bal_s = None if not row or row.balance_cached is None else row.balance_cached
         cur_s = (row.currency or "") if row else ""
-        prov_label = "Selectel" if prov == "selectel" else "Timeweb"
+        if prov == "selectel":
+            prov_label = "Selectel"
+        elif prov == "regru":
+            prov_label = "Reg.ru"
+        else:
+            prov_label = "Timeweb"
         await notify.accountverify_reply(
             tid,
             "\n".join(
@@ -701,7 +790,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             await notify.accountverify_reply(tid, "Не найден: " + code(name))
             return
         try:
-            synced = await sync_account(db, twc, slctl, cfg, name)
+            synced = await sync_account(db, twc, slctl, regru, cfg, name)
             if synced:
                 row = synced
         except Exception:
@@ -719,6 +808,9 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
         if row.provider == "selectel":
             mode_ip = "📡 Selectel Neutron — плавающий IPv4"
             res_lines = await _slctl_account_resources_block(db, slctl, cfg, row)
+        elif row.provider == "regru":
+            mode_ip = "🖥 Reg.ru CloudVPS — ВМ (" + esc(cfg.regru_region.strip() or "openstack-msk1") + ")"
+            res_lines = await _regru_account_resources_block(db, regru, cfg, row)
         else:
             mode_ip = (
                 "📡 плавающий IPv4 (без ВМ)"
@@ -730,7 +822,12 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
             "┈ " + bold("Лимит месяца") + f": {'⚠️ да' if row.limited_by_month else '✅ нет'} (~{left_m})",
             "┈ " + bold("Лимит суток") + f": {'⚠️ да' if row.limited_by_day else '✅ нет'} (~{left_day})",
         ]
-        prov_card = "Selectel" if row.provider == "selectel" else "Timeweb"
+        if row.provider == "selectel":
+            prov_card = "Selectel"
+        elif row.provider == "regru":
+            prov_card = "Reg.ru"
+        else:
+            prov_card = "Timeweb"
         body = "\n".join(
             [
                 "🪪 " + bold("Карточка аккаунта") + f" {code(name)}",
@@ -781,6 +878,7 @@ async def handle_accountverify(update: Update, context: ContextTypes.DEFAULT_TYP
                 bold("Команды аккаунтов"),
                 code("/account_add timeweb name | token"),
                 code("/account_add selectel name | IAM_token"),
+                code("/account_add regru name | api_token"),
                 code("/account_info имя"),
                 code("/account_list"),
                 code("/account_mng имя") + " и флаги " + code("-on -off -heal -day -month -balance"),

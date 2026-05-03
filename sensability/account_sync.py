@@ -6,6 +6,8 @@ from typing import Any
 from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.jwt_util import jwt_payload_unverified
+from sensability.regru_client import RegruClient, regru_balance_from_balance_data
+from sensability.regru_ops import regru_refresh_whitelist
 from sensability.slctl_client import SelectelClient
 from sensability.slctl_constants import SLCTL_TOKEN_REFRESH_MAX_AGE_SEC
 from sensability.twc_constants import (
@@ -112,6 +114,24 @@ async def _ensure_selectel_iam_token(
     return out if out else row
 
 
+async def _sync_regru(
+    db: Database, regru: RegruClient, cfg: Config, name: str, row: AccountRow
+) -> AccountRow | None:
+    now = time.time()
+    patch = _expire_limits(row, now)
+    bd = await regru.get_balance_data(row.api_key)
+    bal, cur = regru_balance_from_balance_data(bd if isinstance(bd, dict) else {})
+    limited_by_balance = bool(bal is not None and bal < cfg.regru_minimum_rubles)
+    patch["balance_cached"] = bal
+    patch["currency"] = cur or "RUB"
+    patch["limited_by_balance"] = 1 if limited_by_balance else 0
+    await db.patch_account(name, patch)
+    row2 = await db.get_account(name)
+    if row2 and row2.provider == "regru":
+        await regru_refresh_whitelist(db, regru, cfg, name, row2, delete_bot_vms=False)
+    return row2
+
+
 async def _sync_selectel(
     db: Database, slctl: SelectelClient, cfg: Config, name: str, row: AccountRow
 ) -> AccountRow | None:
@@ -132,6 +152,7 @@ async def sync_account(
     db: Database,
     twc: TimewebClient,
     slctl: SelectelClient,
+    regru: RegruClient,
     cfg: Config,
     name: str,
 ) -> AccountRow | None:
@@ -140,6 +161,8 @@ async def sync_account(
         return None
     if row.provider == "selectel":
         return await _sync_selectel(db, slctl, cfg, name, row)
+    if row.provider == "regru":
+        return await _sync_regru(db, regru, cfg, name, row)
     return await _sync_timeweb(db, twc, cfg, name, row)
 
 
@@ -165,6 +188,16 @@ def account_eligible_for_brute(row: AccountRow, cfg: Config) -> bool:
         if row.slctl_rate_until is not None and now < row.slctl_rate_until:
             return False
         if row.balance_cached is not None and row.balance_cached < cfg.slctl_minimum_rubles:
+            return False
+        return True
+    if row.provider == "regru":
+        if row.limited_by_month and row.limited_by_month_ts:
+            if now < row.limited_by_month_ts + TWC_MONTH_LIMIT_COOLDOWN_SEC:
+                return False
+        if row.limited_by_day and row.limited_by_day_ts:
+            if now < row.limited_by_day_ts + 86400:
+                return False
+        if row.balance_cached is not None and row.balance_cached < cfg.regru_minimum_rubles:
             return False
         return True
     if row.provider != "timeweb":

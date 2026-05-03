@@ -15,6 +15,7 @@ from sensability.db import Database, db_path
 from sensability.handlers import on_message, schedule_daily
 from sensability.ip_pool import load_networks
 from sensability.notify import TelegramNotify
+from sensability.regru_client import RegruClient
 from sensability.slctl_client import SelectelClient
 from sensability.stats import StatsCollector
 from sensability.tg_format import bold, esc
@@ -39,11 +40,13 @@ async def post_shutdown(application: Application) -> None:
     orch: BruteOrchestrator = application.bot_data["orchestrator"]
     twc: TimewebClient = application.bot_data["twc"]
     slctl: SelectelClient = application.bot_data["slctl"]
+    regru: RegruClient = application.bot_data["regru"]
     db: Database = application.bot_data["db"]
     notify: TelegramNotify = application.bot_data["notify"]
     await orch.stop()
     await twc.aclose()
     await slctl.aclose()
+    await regru.aclose()
     await db.close()
     try:
         await notify.logs("⏹ " + bold("Sensability остановлен"))
@@ -75,6 +78,11 @@ def main() -> None:
     except FileNotFoundError:
         print(f"Файл подсетей Selectel не найден: {cfg.selectel_subnets_path}", file=sys.stderr)
         sys.exit(1)
+    try:
+        load_networks(str(cfg.regru_subnets_path))
+    except FileNotFoundError:
+        print(f"Файл подсетей Reg.ru не найден: {cfg.regru_subnets_path}", file=sys.stderr)
+        sys.exit(1)
 
     proxy = cfg.tg_proxy_url if cfg.tg_proxy_use and cfg.tg_proxy_url else None
     builder = (
@@ -105,9 +113,14 @@ def main() -> None:
     slctl_proxy = cfg.slctl_proxy_url if cfg.slctl_proxy_use and cfg.slctl_proxy_url else None
     slctl_debug = TwcApiDebugController()
     slctl = SelectelClient(slctl_proxy, debug_ctrl=slctl_debug, debug_emit=twc_debug_emit)
+    regru_debug = TwcApiDebugController()
+    regru = RegruClient(None, debug_ctrl=regru_debug, debug_emit=twc_debug_emit)
     tw_nets = load_networks(str(cfg.timeweb_subnets_path))
     sl_nets = load_networks(str(cfg.selectel_subnets_path))
-    orchestrator = BruteOrchestrator(cfg, db, twc, slctl, stats, notify, tw_nets, sl_nets)
+    rg_nets = load_networks(str(cfg.regru_subnets_path))
+    orchestrator = BruteOrchestrator(
+        cfg, db, twc, slctl, regru, stats, notify, tw_nets, sl_nets, rg_nets
+    )
 
     tz = os.getenv("TZ", "Europe/Moscow")
     application.bot_data.update(
@@ -115,8 +128,10 @@ def main() -> None:
         db=db,
         twc=twc,
         slctl=slctl,
+        regru=regru,
         twc_debug=twc_debug,
         slctl_debug=slctl_debug,
+        regru_debug=regru_debug,
         stats=stats,
         notify=notify,
         orchestrator=orchestrator,

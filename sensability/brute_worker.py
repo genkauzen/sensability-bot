@@ -11,6 +11,8 @@ from sensability.config import Config
 from sensability.db import AccountRow, Database
 from sensability.ip_pool import ipv4_in_pool
 from sensability.notify import TelegramNotify
+from sensability.regru_client import RegruApiError, RegruClient, regru_reglet_in_region
+from sensability.regru_ops import regru_pick_plan_and_image
 from sensability.slctl_client import (
     SelectelClient,
     SlctlApiError,
@@ -44,6 +46,7 @@ POLL_ATTEMPTS = 45
 NOTFOUND_GIVEUP = 1
 LIVE_SVC_TIMEWEB = "Timeweb Cloud"
 LIVE_SVC_SELECTEL = "Selectel Cloud"
+LIVE_SVC_REGRU = "Reg.ru CloudVPS"
 
 
 def _live_line_service(label: str) -> str:
@@ -57,21 +60,26 @@ class BruteOrchestrator:
         db: Database,
         twc: TimewebClient,
         slctl: SelectelClient,
+        regru: RegruClient,
         stats: StatsCollector,
         notify: TelegramNotify,
         twc_networks: tuple,
         slctl_networks: tuple,
+        regru_networks: tuple,
     ) -> None:
         self.cfg = cfg
         self.db = db
         self.twc = twc
         self.slctl = slctl
+        self.regru = regru
         self.stats = stats
         self.notify = notify
         self._networks = twc_networks
         self._networks_slctl = slctl_networks
+        self._networks_regru = regru_networks
         self._sem_twc = asyncio.Semaphore(cfg.twc_atmoment_acc)
         self._sem_slctl = asyncio.Semaphore(cfg.slctl_atmoment_acc)
+        self._sem_regru = asyncio.Semaphore(cfg.regru_atmoment_acc)
         self._slctl_float_rr = 0
         self._stop = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
@@ -142,20 +150,27 @@ class BruteOrchestrator:
     async def run_once_account(self, name: str) -> None:
         if self._brute_paused:
             return
-        row0 = await sync_account(self.db, self.twc, self.slctl, self.cfg, name)
+        row0 = await sync_account(self.db, self.twc, self.slctl, self.regru, self.cfg, name)
         if not row0:
             return
-        sem = self._sem_slctl if row0.provider == "selectel" else self._sem_twc
+        if row0.provider == "selectel":
+            sem = self._sem_slctl
+        elif row0.provider == "regru":
+            sem = self._sem_regru
+        else:
+            sem = self._sem_twc
         async with sem:
             if self._brute_paused:
                 return
-            row = await sync_account(self.db, self.twc, self.slctl, self.cfg, name)
+            row = await sync_account(self.db, self.twc, self.slctl, self.regru, self.cfg, name)
             if not row:
                 return
             if not account_eligible_for_brute(row, self.cfg):
                 return
             if row.provider == "selectel":
                 await self._run_brute_selectel(name, row)
+            elif row.provider == "regru":
+                await self._run_brute_regru(name, row)
             elif account_prefers_floating_ip_probe(row):
                 await self._run_brute_floating_ip(name, row)
             else:
@@ -640,6 +655,144 @@ class BruteOrchestrator:
         except Exception:
             pass
 
+    async def _run_brute_regru(self, name: str, row: AccountRow) -> None:
+        await self.stats.track_account(name, row.balance_cached)
+        region = self.cfg.regru_region.strip() or "openstack-msk1"
+        picked = await regru_pick_plan_and_image(self.regru, row.api_key, region)
+        if not picked:
+            await self.stats.add_vm_fail()
+            await self.db.log_event("regru_pick_plan_fail", name, {"region": region})
+            return
+        size_slug, image_slug = picked
+        vm_name = f"{self.cfg.twc_vm_name}-regru-{row.name}-{uuid.uuid4().hex[:8]}"
+        try:
+            reglet = await self.regru.create_reglet(
+                row.api_key,
+                name=vm_name,
+                size_slug=size_slug,
+                image_slug=image_slug,
+            )
+        except RegruApiError as e:
+            await self.stats.add_vm_fail()
+            await self.db.log_event(
+                "regru_create_fail",
+                name,
+                {"status": e.status, "msg": e.body[:2000], "region": region},
+            )
+            return
+
+        rid = reglet.get("id")
+        try:
+            rid_i = int(rid)
+        except (TypeError, ValueError):
+            await self.stats.add_vm_fail()
+            return
+
+        await self.stats.add_vm_ok()
+        pub_ip: str | None = None
+        snap: dict[str, Any] | None = reglet if isinstance(reglet, dict) else None
+
+        def _pub_from_reglet(r: dict[str, Any]) -> str | None:
+            ip = str(r.get("ip") or "").strip()
+            return ip if ip and ip.count(".") == 3 else None
+
+        pub_ip = _pub_from_reglet(reglet) if isinstance(reglet, dict) else None
+        notfound_streak = 0
+        for _ in range(POLL_ATTEMPTS):
+            if self._stop.is_set() or self._brute_paused or pub_ip:
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+            await self.stats.add_ipv4_check()
+            try:
+                r2 = await self.regru.get_reglet(row.api_key, rid_i)
+                snap = r2
+                pub_ip = _pub_from_reglet(r2)
+            except RegruApiError as ex:
+                if ex.status == 404:
+                    notfound_streak += 1
+                    if notfound_streak >= NOTFOUND_GIVEUP:
+                        await self.notify.live(
+                            "\n".join(
+                                [
+                                    "🖥 " + bold("Live — Reg.ru CloudVPS"),
+                                    _live_line_service(LIVE_SVC_REGRU),
+                                    "┈ " + bold("Аккаунт") + f" {code(name)}",
+                                    "┈ " + bold("ВМ") + f" {code(vm_name)}",
+                                    "┈ " + bold("IPv4") + f" {code('— (ресурс удалён)')}",
+                                ]
+                            )
+                        )
+                        await self.db.log_event(
+                            "regru_registry_drop",
+                            name,
+                            {"reglet_id": rid_i, "reason": "404"},
+                        )
+                        return
+                elif self.cfg.full_logs:
+                    await self.notify.logs(f"{bold('regru poll')} {esc(name)}: {esc(str(ex)[:200])}")
+
+        region_live = str((snap or {}).get("region_slug") or region or "—")
+        live_lines = [
+            "🖥 " + bold("Live — Reg.ru CloudVPS"),
+            _live_line_service(LIVE_SVC_REGRU),
+            "┈ " + bold("Аккаунт") + f" {code(name)}",
+            "┈ " + bold("ВМ") + f" {code(vm_name)}",
+            "┈ " + bold("Регион") + f" {code(region_live)}",
+            "┈ " + bold("IPv4") + f" {code(pub_ip or '—')}",
+        ]
+        live_lines.extend(self._ip_live_extra_lines(pub_ip, pool_networks=self._networks_regru))
+        await self.notify.live("\n".join(live_lines))
+
+        if snap and not regru_reglet_in_region(snap, region):
+            await self.stats.add_vm_deleted_no_pool()
+            try:
+                await self.regru.delete_reglet(row.api_key, rid_i)
+            except Exception:
+                pass
+            await self.db.log_event(
+                "regru_wrong_region",
+                name,
+                {"reglet_id": rid_i, "region_slug": region_live},
+            )
+            return
+
+        if not pub_ip:
+            await self.stats.add_vm_deleted_no_pool()
+            try:
+                await self.regru.delete_reglet(row.api_key, rid_i)
+            except Exception:
+                pass
+            await self.db.log_event("regru_no_ipv4", name, {"reglet_id": rid_i})
+            return
+
+        if ipv4_in_pool(pub_ip, self._networks_regru):
+            await self.stats.add_pool_hit()
+            await self.db.patch_account(name, {"brute_enabled": 0})
+            await self.db.append_whitelist_regru(name, rid_i)
+            await self.db.log_event(
+                "pool_hit_regru",
+                name,
+                {"ip": pub_ip, "reglet_id": rid_i, "region": region_live},
+            )
+            await self.notify.totalresult(
+                "\n".join(
+                    [
+                        "🎯 " + bold("Whitelist"),
+                        "🖥 " + bold("Reg.ru CloudVPS"),
+                        "┈ " + bold("Аккаунт") + f" {code(name)}",
+                        "┈ " + bold("Публичный IPv4") + f" {code(pub_ip)}",
+                        "┈ " + bold("Reglet id") + f" {code(str(rid_i))} — в белом списке, автоматическое удаление отключено",
+                    ]
+                )
+            )
+            return
+
+        await self.stats.add_vm_deleted_no_pool()
+        try:
+            await self.regru.delete_reglet(row.api_key, rid_i)
+        except Exception:
+            pass
+        await self.db.log_event("regru_ip_not_in_pool", name, {"ip": pub_ip, "reglet_id": rid_i})
 
     async def _delete_float_later(self, api_key: str, floating_ip_id: str, acc_name: str) -> None:
         delay = max(1, self.cfg.twc_vm_alivetime_minutes) * 60
@@ -704,7 +857,7 @@ class BruteOrchestrator:
                 last_sync = now
                 for acc in await self.db.list_accounts():
                     try:
-                        await sync_account(self.db, self.twc, self.slctl, self.cfg, acc.name)
+                        await sync_account(self.db, self.twc, self.slctl, self.regru, self.cfg, acc.name)
                     except Exception:
                         log.exception("sync %s", acc.name)
             while self._brute_paused and not self._stop.is_set():
